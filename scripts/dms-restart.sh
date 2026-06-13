@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # dms-restart.sh — bring back the DankMaterialShell bar/launcher after it died.
 #
-# Symptom this fixes (README issue #7): top bar missing and the app launcher
+# Symptom this fixes (README issue #5): top bar missing and the app launcher
 # (Super) does nothing. Usually happens when niri/greetd was restarted by hand
 # mid-session and dms.service raced the Wayland socket, crash-looped, and got
 # rate-limited by systemd (`start-limit-hit`, `Failed to create wl_display`).

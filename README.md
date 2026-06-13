@@ -68,7 +68,7 @@ and (b) the machine sat in s2idle indefinitely instead of dropping to a real low
   - [`configs/systemd/sleep.conf.d/10-hibernate-delay.conf`](configs/systemd/sleep.conf.d/10-hibernate-delay.conf):
     `HibernateDelaySec=60min`.
 
-Kernel cmdline lives in [`configs/default/limine.cmdline`](configs/default/limine.cmdline) — see issue #5
+Kernel cmdline lives in [`configs/default/limine.cmdline`](configs/default/limine.cmdline) — see issue #4
 for *why you must not edit `limine.conf` directly*. No `resume` mkinitcpio hook is needed; the
 `systemd` hook handles resume from the cmdline.
 
@@ -78,29 +78,7 @@ Run [`scripts/verify-suspend.sh`](scripts/verify-suspend.sh) to confirm the whol
 > Requires a **reboot** to activate — the running kernel has no `resume=` until you reboot, so do
 > **not** `systemctl hibernate` before rebooting or the session won't come back.
 
-### 3. niri desktop wedges after a VT switch ("another niri session is already running")
-
-**Symptom:** After switching to a text console (`Ctrl+Alt+F2`) and back, VT1 shows a **text console
-you can type into** instead of the desktop, and logging in at tuigreet is refused with
-*"another niri session is already running."*
-
-**Root cause:** A Wayland compositor only holds the GPU (DRM master) while *its* VT is in front.
-On the switch back, niri **failed to re-acquire the AMD iGPU** (`/dev/dri/card2`) — logs fill with
-`error queueing frame ... Page flip commit failed ... Permission denied (os error 13)` and
-`pausing session`. The process stays alive but stops rendering, **and keeps holding niri's
-single-instance lock**, so no new session can start. Likely a DRM-master handoff hiccup on the
-hybrid GPU.
-
-**Recovery** (from another VT or SSH — run [`scripts/niri-recover.sh`](scripts/niri-recover.sh)):
-```bash
-sudo pkill -KILL -u "$USER" -x niri   # clears the wedged process + its lock
-sudo systemctl restart greetd         # fresh tuigreet greeter on VT1
-sudo chvt 1                           # then log in normally
-```
-
-**Confirm it's this bug:** `journalctl _UID=$(id -u) -b | grep 'Page flip'`.
-
-### 4. niri config is DankMaterialShell (DMS) managed — don't hand-edit
+### 3. niri config is DankMaterialShell (DMS) managed — don't hand-edit
 
 The niri config at `~/.config/niri/` is the canonical **DMS** layout (`dms setup`).
 `config.kdl` includes `dms/{colors,layout,alttab,binds,outputs,cursor}.kdl`.
@@ -112,7 +90,7 @@ The niri config at `~/.config/niri/` is the canonical **DMS** layout (`dms setup
 - The old hand-written `~/.config/niri/cfg/*.kdl` modular setup was **deleted** — don't reintroduce
   `cfg/` includes.
 
-### 5. Limine cmdline gotcha — edit `/etc/default/limine`, not `limine.conf`
+### 4. Limine cmdline gotcha — edit `/etc/default/limine`, not `limine.conf`
 
 Editing `/boot/limine.conf` directly is **futile**: the `limine-update` / mkinitcpio hook
 regenerates it from `KERNEL_CMDLINE[default]` in **`/etc/default/limine`**. Put kernel params there,
@@ -121,13 +99,13 @@ then:
 sudo limine-update
 ```
 
-### 6. DMS bar/launcher missing after a manual niri/greetd restart
+### 5. DMS bar/launcher missing after a manual niri/greetd restart
 
 **Symptom:** Desktop is up but the **top bar is gone** and the **app launcher (Super) does
 nothing** (it just spawns stray `app-niri-dms-*` scopes).
 
-**Root cause:** When niri/greetd is restarted *by hand* mid-session (e.g. the issue #3
-recovery), `dms.service` can launch **before niri's Wayland socket is ready**
+**Root cause:** When niri/greetd is restarted *by hand* mid-session,
+`dms.service` can launch **before niri's Wayland socket is ready**
 (`Failed to create wl_display (Connection refused)`), crash-loop, and trip systemd's
 start-rate limit (`start-limit-hit`) — after which it stays dead. A normal boot orders
 this correctly and doesn't hit it.
@@ -139,10 +117,7 @@ systemctl --user restart dms.service
 ```
 Confirm: `pgrep -af 'qs -p /usr/share/quickshell/dms'`. **No reboot needed.**
 
-> Tie-in: after running the issue #3 recovery, check `systemctl --user is-active dms.service`
-> and restart DMS if it's dead.
-
-### 7. Benign boot warnings (safe to ignore)
+### 6. Benign boot warnings (safe to ignore)
 
 These appear every boot and are **not** problems:
 - `RDSEED32 is broken. Please update your firmware.`
@@ -158,8 +133,7 @@ These appear every boot and are **not** problems:
 linux-asus-g14-ga403wr/
 ├── README.md
 ├── scripts/
-│   ├── niri-recover.sh      # recover a wedged niri/greetd session (issue #3)
-│   ├── dms-restart.sh       # bring back the DMS bar/launcher after a restart (issue #6)
+│   ├── dms-restart.sh       # bring back the DMS bar/launcher after a restart (issue #5)
 │   └── verify-suspend.sh    # check the suspend/hibernate config is intact (issues #1, #2)
 └── configs/                 # sanitized snapshots of the working config (machine-specific!)
     ├── modprobe.d/nvidia-power.conf
