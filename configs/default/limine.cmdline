@@ -6,10 +6,12 @@
 #
 # Machine-specific: replace the UUID and resume_offset with YOUR OWN
 #   root UUID:       findmnt -no UUID /
-#   resume_offset:   sudo filefrag -v /path/to/swapfile | awk 'NR==4{print $4}' | tr -d .
-#                    (offset of the swapfile's first physical block)
+#   resume_offset:   sudo btrfs inspect-internal map-swapfile -r /swap/swapfile
+#                    ^ btrfs MUST use map-swapfile, NOT filefrag (filefrag is the ext4 way).
+#                    The swapfile must also be a single contiguous extent or resume fails
+#                    with `resume failed (-5)` — see README issue #2's ⚠️ callout.
 
 KERNEL_CMDLINE[default]+="quiet nowatchdog splash rw rootflags=subvol=/@ root=UUID=50bc7425-0440-496b-b77f-ff8270744621"
 
 # s2idle long-suspend fix (README issue #2): disable eDP PSR + enable hibernate resume (btrfs swapfile)
-KERNEL_CMDLINE[default]+=" amdgpu.dcdebugmask=0x10 resume=UUID=50bc7425-0440-496b-b77f-ff8270744621 resume_offset=14165248"
+KERNEL_CMDLINE[default]+=" amdgpu.dcdebugmask=0x10 resume=UUID=50bc7425-0440-496b-b77f-ff8270744621 resume_offset=23799040"

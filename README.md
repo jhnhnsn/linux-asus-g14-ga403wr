@@ -23,32 +23,51 @@ every entry is something that actually broke on this machine and the fix that re
 
 ## Issues & solutions
 
-### 1. Resume-from-lid hard hang on s2idle (short cycles)
+### 1. NVIDIA dGPU suspend/resume — use the kernel-notifier path, not VRAM preservation
 
-**Symptom:** Closing the lid and reopening occasionally produced a full system wedge
-(force power-off required, then cold boot). Log signature: boot ends at
-`PM: suspend entry (s2idle)` with **no** `SMU is resumed` / `PM: suspend exit` after it.
+**Symptom(s):** Closing the lid and reopening intermittently killed the desktop. The
+*kernel* resumed fine (`SMU is resumed successfully`, `PM: suspend exit`), but the nvidia
+driver then melted down restoring its VRAM:
+```
+NVRM: GPU0 _clientUnmapInterBackRefMappings: Failed to auto-unmap backref (status=0x57)
+NVRM: GPU0 nvAssertFailedNoLog: Assertion failed ... rs_client.c / map.c / rs_resource.c
+```
+A session client holding live nvidia mappings took a `SIGABRT` → black screen. (Separately,
+the same heavyweight path aborted *hibernate* with `nv_pmops_freeze returns -5`.)
 
-**Root cause:** NVIDIA dGPU loaded and in use, but `nvidia-suspend/resume/hibernate.service`
-were **disabled** and `NVreg_EnableS0ixPowerManagement=0`, so dGPU VRAM was never saved/
-restored across s2idle — a known intermittent-resume-hang recipe on s2idle hybrid laptops.
+**Root cause:** we were on NVIDIA's **VRAM-preservation path** — `PreserveVideoMemoryAllocations=1`
++ the `nvidia-suspend/resume/hibernate` systemd services + the `/proc/driver/nvidia/suspend`
+interface. That "save & restore *all* VRAM" machinery is the thing that corrupts on resume and
+races the initramfs on hibernate. NVIDIA's docs describe a second, **mutually-exclusive** path —
+the kernel suspend-notifier callbacks — which *"requires no configuration."* You pick one; mixing
+them is what breaks. **Full write-up + sources:** [`docs/nvidia-suspend-path-b.md`](docs/nvidia-suspend-path-b.md).
 
-**Fix:**
-1. Enable the NVIDIA sleep services:
+**Fix — switch to Path B (kernel notifiers):**
+1. Disable the VRAM-preservation services:
    ```bash
-   sudo systemctl enable nvidia-suspend.service nvidia-resume.service nvidia-hibernate.service
+   sudo systemctl disable nvidia-suspend.service nvidia-resume.service nvidia-hibernate.service
    ```
-2. Add [`configs/modprobe.d/nvidia-power.conf`](configs/modprobe.d/nvidia-power.conf):
+2. Set [`configs/modprobe.d/nvidia-power.conf`](configs/modprobe.d/nvidia-power.conf) to:
    ```
-   options nvidia NVreg_EnableS0ixPowerManagement=1 NVreg_PreserveVideoMemoryAllocations=1
+   options nvidia NVreg_PreserveVideoMemoryAllocations=0
    ```
-3. Rebuild initramfs and **reboot** (the module param only goes live on reboot):
+3. Keep nvidia **out of the initramfs** — install hook
+   [`configs/initcpio/install/nvidia-noinitramfs`](configs/initcpio/install/nvidia-noinitramfs)
+   added last in `HOOKS` (required for hibernate resume; see the hook's own comments).
+4. Rebuild + regenerate boot entries, then **reboot** (params are read at module load):
    ```bash
-   sudo mkinitcpio -P
+   sudo mkinitcpio -P && sudo limine-update
    ```
 
-**Verify:** `grep EnableS0ix /proc/driver/nvidia/params` → `1`. A healthy resume logs
-`amdgpu: SMU is resumed successfully!` and `PM: suspend exit`.
+**Verify:** `grep PreserveVideoMemoryAllocations /proc/driver/nvidia/params` → `0`;
+`systemctl is-enabled nvidia-suspend.service` → `disabled`. A healthy resume logs
+`amdgpu: SMU is resumed successfully!` / `PM: suspend exit` with **no** `NVRM ... nvAssertFailed`
+storm afterward.
+
+**Trade-off:** GPU contexts aren't preserved across suspend — an app *actively* using the dGPU
+(a running game / CUDA job) can lose its context on resume. Fine here: the dGPU is idle offload,
+we don't suspend mid-game. Games still run via `prime-run`; external HDMI (wired to the dGPU)
+still works.
 
 ### 2. Long/overnight s2idle still wedges (deep-suspend fix)
 
@@ -61,8 +80,11 @@ and (b) the machine sat in s2idle indefinitely instead of dropping to a real low
 **Fix:**
 - **Disable eDP PSR** via kernel cmdline `amdgpu.dcdebugmask=0x10`.
 - **suspend-then-hibernate** so a long s2idle escalates to S4 (hibernate):
-  - 36 GiB NOCOW btrfs swapfile on a dedicated nested `@/swap` subvol (excluded from snapshots).
-  - `resume=UUID=<root> resume_offset=<offset>` on the kernel cmdline.
+  - 36 GiB NOCOW btrfs swapfile on a dedicated nested `@/swap` subvol (excluded from snapshots),
+    created with `btrfs filesystem mkswapfile` so it is a **single contiguous extent**
+    (see the ⚠️ callout below — this is the part that actually bites).
+  - `resume=UUID=<root> resume_offset=<offset>` on the kernel cmdline, where `<offset>` comes from
+    **`btrfs inspect-internal map-swapfile -r /swap/swapfile`** (NOT `filefrag` — that's the ext4 way).
   - [`configs/systemd/logind.conf.d/10-lid-hibernate.conf`](configs/systemd/logind.conf.d/10-lid-hibernate.conf):
     `HandleLidSwitch=suspend-then-hibernate` (+ `ExternalPower` — the overnight freeze was on AC).
   - [`configs/systemd/sleep.conf.d/10-hibernate-delay.conf`](configs/systemd/sleep.conf.d/10-hibernate-delay.conf):
@@ -77,6 +99,37 @@ Run [`scripts/verify-suspend.sh`](scripts/verify-suspend.sh) to confirm the whol
 
 > Requires a **reboot** to activate — the running kernel has no `resume=` until you reboot, so do
 > **not** `systemctl hibernate` before rebooting or the session won't come back.
+
+#### ⚠️ The hibernation swapfile MUST be a single contiguous extent (btrfs gotcha)
+
+The single most painful failure here, and the most underdocumented.
+
+**Symptom:** hibernate writes fine and the kernel even *finds* the image on resume
+(`PM: Image signature found, resuming`), then **fails mid-load** and cold-boots — session gone,
+`boot_id` changed:
+```
+PM: hibernation: Failed to load image, recovering.
+PM: hibernation: resume failed (-5)        # -5 = EIO
+```
+
+**Cause:** the btrfs swapfile was **fragmented** — `filefrag /swap/swapfile` reports "2 extents found".
+`swapon` doesn't care about fragmentation so it silently works, but **early resume reads the swapfile
+as one contiguous run starting at `resume_offset`**. The header (extent #1) reads fine, then the bulk
+load dies the instant it crosses into a physically non-contiguous extent.
+
+**Fix — recreate it contiguous and re-point the offset:**
+```bash
+sudo swapoff /swap/swapfile
+sudo rm /swap/swapfile
+sudo btrfs filesystem mkswapfile --size 36g /swap/swapfile   # single contiguous NOCOW extent
+sudo swapon  /swap/swapfile
+filefrag /swap/swapfile                                      # MUST report "1 extent found"
+sudo btrfs inspect-internal map-swapfile -r /swap/swapfile   # NEW resume_offset (it will change)
+```
+Put the new offset into `/etc/default/limine` → `sudo limine-update` → **reboot** → test with
+`systemctl hibernate`. Success = your windows/terminals restore **and** `boot_id` is unchanged after
+wake. A changed `boot_id` means it cold-booted (resume failed). Breadcrumb trick to tell them apart:
+`cat /proc/sys/kernel/random/boot_id` before hibernating, compare after waking.
 
 ### 3. niri config is DankMaterialShell (DMS) managed — don't hand-edit
 
@@ -125,6 +178,52 @@ These appear every boot and are **not** problems:
 - `platform acp_asoc_acp70.0: warning: No matching ASoC machine driver found`
 - `bluetoothd: Failed to set default system config for hci0`
 
+### 7. dGPU off by default via supergfxctl (Integrated mode) — the real cure
+
+After fighting the NVIDIA dGPU through suspend/resume for a long time (issue #1, the hibernate
+`-5`, VRAM-preservation crashes, `Xid 13` storms on resume), the decisive fix was to **take the
+dGPU out of the picture entirely for daily use**. It's a Blackwell **render-offload** GPU the
+desktop doesn't use for display — the internal panel and USB-C/DisplayPort outputs are all on the
+**amdgpu** iGPU; only the **HDMI** port is wired to the dGPU. So for everyday + USB-C external
+monitors, the dGPU is pure dead weight in the sleep path.
+
+**Setup:**
+```bash
+sudo pacman -S --needed supergfxctl asusctl rog-control-center
+sudo systemctl enable --now supergfxd.service asusd.service
+supergfxctl -s     # supported modes; on the GA403WR: [Integrated, Hybrid, AsusMuxDgpu]
+```
+- **Integrated** = dGPU force-off (removed from the PCI bus). Daily driver. Suspend/resume is
+  pure amdgpu — boring and reliable. No nvidia, no Xid.
+- **Hybrid** = dGPU available for render-offload / gaming (`prime-run`) and the HDMI port.
+- **AsusMuxDgpu** = MUX the panel directly to the dGPU for max gaming perf (needs reboot).
+
+Switch with [`scripts/gpu-mode.sh`](scripts/gpu-mode.sh) (see the ⚠️ gotcha below for *why* the
+plain `supergfxctl -m` flow fails on this machine).
+
+**Verify Integrated is live:** `supergfxctl -g` → `Integrated`, `lsmod | grep '^nvidia'` empty,
+and `/sys/bus/pci/devices/0000:64:00.0` is **gone** (dGPU removed from the bus).
+
+#### ⚠️ supergfxd's logout-switching does NOT complete under greetd
+
+`supergfxctl -m <mode>` only *arms* the switch and then waits for a full graphical logout
+(`action: WaitLogout`, 30 s timeout). Under **greetd** that never happens — greetd immediately
+respawns the greeter, and any lingering session (e.g. a `claude`/shell in another TTY) keeps the
+user "logged in" — so it logs `Time (30 seconds) for logout exceeded` and **aborts without
+persisting the mode**. A plain reboot then boots back into the *old* mode (the pending switch was
+never written to `/etc/supergfxd.conf`). Two ways that actually work:
+
+1. **From a TTY, stop the graphical session first** (what `scripts/gpu-mode.sh` does):
+   `systemctl stop greetd` → kill the orphaned `niri`/clients + `systemctl stop nvidia-powerd`
+   → `modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia` → `systemctl restart supergfxd`
+   (it now removes the dGPU and writes mode=Integrated) → `systemctl start greetd`.
+2. **Edit the config + reboot:** set `"mode": "Integrated"` in `/etc/supergfxd.conf` while
+   `supergfxd` is stopped, then reboot — supergfxd applies the mode at boot, before any session
+   holds the dGPU.
+
+After either path, the **DMS bar race (issue #5)** usually fires because niri got restarted —
+fix with `scripts/dms-restart.sh`.
+
 ---
 
 ## Repo layout
@@ -132,12 +231,16 @@ These appear every boot and are **not** problems:
 ```
 linux-asus-g14-ga403wr/
 ├── README.md
+├── docs/
+│   └── nvidia-suspend-path-b.md   # why we use the kernel-notifier path + sources (issue #1)
 ├── scripts/
 │   ├── dms-restart.sh       # bring back the DMS bar/launcher after a restart (issue #5)
+│   ├── gpu-mode.sh          # switch Integrated <-> Hybrid the way that works under greetd (issue #7)
 │   └── verify-suspend.sh    # check the suspend/hibernate config is intact (issues #1, #2)
 └── configs/                 # sanitized snapshots of the working config (machine-specific!)
     ├── modprobe.d/nvidia-power.conf
     ├── modprobe.d/nvidia-drm.conf
+    ├── initcpio/install/nvidia-noinitramfs  # keeps nvidia out of the initramfs (issue #1)
     ├── default/limine.cmdline
     └── systemd/
         ├── logind.conf.d/10-lid-hibernate.conf

@@ -1,0 +1,38 @@
+#!/bin/bash
+# /etc/initcpio/install/nvidia-noinitramfs
+# mkinitcpio install hook: keep the nvidia driver from LOADING inside the initramfs.
+# Add it LAST in HOOKS=(...) in /etc/mkinitcpio.conf, then `mkinitcpio -P`.
+#
+# Why: on this hybrid laptop nvidia gets loaded in early boot (explicit force-load via
+# /usr/lib/modules-load.d/nvidia-utils.conf, plus it modalias-matches the dGPU so udev
+# would coldplug it too). During hibernate *resume* — which happens in the initramfs,
+# before the root fs is mounted — the kernel must freeze the dGPU, but nvidia's freeze
+# fails (`nv_pmops_freeze returns -5`) and aborts the whole restore -> cold boot.
+# amdgpu is the real display driver, so nvidia has no business being in early boot here.
+#
+# mkinitcpio v41 has no native module-omit (`!mod` in MODULES errors; a modprobe
+# `blacklist` alone does not stop it being packed), so we edit the image directly.
+# This hook edits ONLY the initramfs image ($BUILDROOT). The real system is untouched,
+# so nvidia still loads normally there (gaming / render-offload unaffected).
+
+build() {
+    # 1. Remove the explicit early force-load so systemd-modules-load won't pull nvidia in.
+    rm -f "$BUILDROOT"/usr/lib/modules-load.d/nvidia-utils.conf
+    rm -f "$BUILDROOT"/etc/modules-load.d/nvidia-utils.conf
+
+    # 2. Blacklist nvidia* INSIDE the initramfs so udev coldplug won't auto-load it either.
+    mkdir -p "$BUILDROOT/etc/modprobe.d"
+    cat > "$BUILDROOT/etc/modprobe.d/blacklist-nvidia-initramfs.conf" <<'EOF'
+blacklist nvidia
+blacklist nvidia_modeset
+blacklist nvidia_uvm
+blacklist nvidia_drm
+EOF
+}
+
+help() {
+    cat <<'EOF'
+Prevents the nvidia driver from loading inside the initramfs so hibernate resume can
+freeze the dGPU. Only the initramfs is modified; the real system is left untouched.
+EOF
+}
