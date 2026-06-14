@@ -69,36 +69,48 @@ storm afterward.
 we don't suspend mid-game. Games still run via `prime-run`; external HDMI (wired to the dGPU)
 still works.
 
-### 2. Long/overnight s2idle still wedges (deep-suspend fix)
+> Path B made *short* s2idle reliable, but a separate, intermittent **long-sleep** wedge
+> remained — later root-caused to an nvidia ACPI D-notifier failure during s0ix and resolved
+> by hibernating on lid close. See **issue #2** and
+> [`docs/nvidia-pegp-dnotifier-s2idle-wedge.md`](docs/nvidia-pegp-dnotifier-s2idle-wedge.md).
 
-**Symptom:** Even after fix #1, a *long* lid-close (e.g. ~12 h, on AC) entered suspend and
-never resumed. Short cycles were fine; long ones hung. Not battery drain — it was plugged in.
+### 2. Long/overnight s2idle wedges — root cause was nvidia; resolution is hibernate-on-lid
 
-**Root cause (two parts):** (a) eDP **Panel Self Refresh (PSR)** was active (`eDP-2: PSR support 1`)
-and (b) the machine sat in s2idle indefinitely instead of dropping to a real low-power state.
+**Symptom:** Even after fix #1, a *long* lid-close (e.g. overnight) entered s2idle and never
+resumed — force-power required. **Short cycles were always fine; only long ones hung.** Not
+battery drain (on AC), not s0ix depth.
 
-**Fix:**
-- **Disable eDP PSR** via kernel cmdline `amdgpu.dcdebugmask=0x10`.
-- **suspend-then-hibernate** so a long s2idle escalates to S4 (hibernate):
-  - 36 GiB NOCOW btrfs swapfile on a dedicated nested `@/swap` subvol (excluded from snapshots),
-    created with `btrfs filesystem mkswapfile` so it is a **single contiguous extent**
-    (see the ⚠️ callout below — this is the part that actually bites).
-  - `resume=UUID=<root> resume_offset=<offset>` on the kernel cmdline, where `<offset>` comes from
-    **`btrfs inspect-internal map-swapfile -r /swap/swapfile`** (NOT `filefrag` — that's the ext4 way).
-  - [`configs/systemd/logind.conf.d/10-lid-hibernate.conf`](configs/systemd/logind.conf.d/10-lid-hibernate.conf):
-    `HandleLidSwitch=suspend-then-hibernate` (+ `ExternalPower` — the overnight freeze was on AC).
-  - [`configs/systemd/sleep.conf.d/10-hibernate-delay.conf`](configs/systemd/sleep.conf.d/10-hibernate-delay.conf):
-    `HibernateDelaySec=60min`.
+**Root cause (found 2026-06-14):** **nvidia.** During deep s0ix the EC dispatches an ACPI
+D-notifier to `PEGP` (the dGPU) and the still-bound nvidia driver fails it
+(`NVRM: RmHandleDNotifierEvent ... status=0x11`), triggering a spurious wake that intermittently
+hangs resume. `amd-s2idle` (pkg `amd-debug-tools`) measured **71–98.7 % hardware sleep**, so
+residency was never the problem — short cycles just never lasted long enough to catch a spurious
+wake. Full analysis + method: [`docs/nvidia-pegp-dnotifier-s2idle-wedge.md`](docs/nvidia-pegp-dnotifier-s2idle-wedge.md).
 
-Kernel cmdline lives in [`configs/default/limine.cmdline`](configs/default/limine.cmdline) — see issue #4
-for *why you must not edit `limine.conf` directly*. No `resume` mkinitcpio hook is needed; the
-`systemd` hook handles resume from the cmdline.
+> Earlier theories here were dead ends: eDP **PSR** (`amdgpu.dcdebugmask=0x10` is kept as
+> harmless hygiene) and **suspend-then-hibernate** escalation — the latter does s2idle *first*,
+> so it wedged in the exact same nvidia path before it could ever escalate. Both removed.
 
-**Verify:** after a long suspend, `journalctl -b -1 | grep -E 'PM: hibernation|Reached target Hibernate'`.
-Run [`scripts/verify-suspend.sh`](scripts/verify-suspend.sh) to confirm the whole config is in place.
+**Fix — keep the dGPU out of the sleep path:**
+- **Lid close → hibernate (S4)**, not s2idle — powers fully off, so there's no s0ix and nothing
+  pokes `PEGP`; also zero drain while closed.
+  [`configs/systemd/logind.conf.d/10-lid-hibernate.conf`](configs/systemd/logind.conf.d/10-lid-hibernate.conf):
+  `HandleLidSwitch=hibernate`, `HandleLidSwitchExternalPower=hibernate`, and
+  `HandleLidSwitchDocked` left unset (= `ignore`, so clamshell with an external monitor keeps running).
+- **Unload nvidia before any sleep** —
+  [`configs/systemd/system-sleep/80-nvidia-teardown.sh`](configs/systemd/system-sleep/80-nvidia-teardown.sh):
+  stops `nvidia-powerd` + unloads the whole nvidia stack on `pre`, reloads on `post`, **fail-open**
+  (never blocks suspend). Verified `nvidia_mods` 0→5. Also makes manual `systemctl suspend`
+  (fast s2idle) safe — the dGPU is driverless during sleep, so there's no NVRM handler to fail.
 
-> Requires a **reboot** to activate — the running kernel has no `resume=` until you reboot, so do
-> **not** `systemctl hibernate` before rebooting or the session won't come back.
+> ⚠️ Hibernate powers the machine **off** — opening the lid does **not** wake it; press the
+> **power button** to boot back and resume (same `boot_id`, session intact).
+
+Hibernate still depends on a correct swapfile + cmdline (next ⚠️). Kernel cmdline lives in
+[`configs/default/limine.cmdline`](configs/default/limine.cmdline) — see issue #4 for why you must
+not edit `limine.conf` directly. No `resume` mkinitcpio hook is needed; the `systemd` hook handles
+resume from the cmdline. Confirm the whole config with
+[`scripts/verify-suspend.sh`](scripts/verify-suspend.sh).
 
 #### ⚠️ The hibernation swapfile MUST be a single contiguous extent (btrfs gotcha)
 
@@ -178,51 +190,35 @@ These appear every boot and are **not** problems:
 - `platform acp_asoc_acp70.0: warning: No matching ASoC machine driver found`
 - `bluetoothd: Failed to set default system config for hci0`
 
-### 7. dGPU off by default via supergfxctl (Integrated mode) — the real cure
+### 7. dGPU off by default for daily use — now via cardwire (supergfxctl deprecated)
 
-After fighting the NVIDIA dGPU through suspend/resume for a long time (issue #1, the hibernate
-`-5`, VRAM-preservation crashes, `Xid 13` storms on resume), the decisive fix was to **take the
-dGPU out of the picture entirely for daily use**. It's a Blackwell **render-offload** GPU the
-desktop doesn't use for display — the internal panel and USB-C/DisplayPort outputs are all on the
-**amdgpu** iGPU; only the **HDMI** port is wired to the dGPU. So for everyday + USB-C external
-monitors, the dGPU is pure dead weight in the sleep path.
+The desktop never uses the dGPU for display — the internal panel + USB-C/DisplayPort outputs are
+all on the **amdgpu** iGPU; only the **HDMI** port is wired to the dGPU. So for everyday + USB-C
+external monitors, the Blackwell render-offload card is dead weight; keep it off and only switch
+it on for gaming.
 
-**Setup:**
+**supergfxctl graphics switching is deprecated upstream** (asus-linux.org). The daily switcher is
+now **cardwire** (eBPF LSM), which switches **instantly — no reboot, no logout** (supergfxctl's
+logout-switch never completed under greetd; that entire saga is gone):
+
 ```bash
-sudo pacman -S --needed supergfxctl asusctl rog-control-center
-sudo systemctl enable --now supergfxd.service asusd.service
-supergfxctl -s     # supported modes; on the GA403WR: [Integrated, Hybrid, AsusMuxDgpu]
+cardwire set integrated    # daily driver — dGPU device nodes blocked
+cardwire set hybrid        # dGPU available for prime-run / gaming
 ```
-- **Integrated** = dGPU force-off (removed from the PCI bus). Daily driver. Suspend/resume is
-  pure amdgpu — boring and reliable. No nvidia, no Xid.
-- **Hybrid** = dGPU available for render-offload / gaming (`prime-run`) and the HDMI port.
-- **AsusMuxDgpu** = MUX the panel directly to the dGPU for max gaming perf (needs reboot).
+Config `/etc/cardwire/cardwire.toml` (`auto_apply_gpu_state=true`, `experimental_nvidia_block=true`).
+Gaming: `cardwire set hybrid` → `prime-run <game>` → `cardwire set integrated`.
 
-Switch with [`scripts/gpu-mode.sh`](scripts/gpu-mode.sh) (see the ⚠️ gotcha below for *why* the
-plain `supergfxctl -m` flow fails on this machine).
+> #### ⚠️ cardwire-Integrated is NOT supergfxctl-Integrated — and does NOT fix suspend
+>
+> Both call it "Integrated," but **supergfxctl removed the dGPU from the PCI bus** whereas
+> **cardwire only blocks the device nodes (eBPF) and leaves the nvidia driver bound.** That
+> difference is exactly why suspend kept wedging under cardwire: the bound driver still chokes on
+> the `PEGP` ACPI D-notifier during s0ix (**issue #2**). cardwire is the convenient GPU switcher;
+> the suspend problem is solved separately by **hibernating on lid close**, not by the GPU mode.
 
-**Verify Integrated is live:** `supergfxctl -g` → `Integrated`, `lsmod | grep '^nvidia'` empty,
-and `/sys/bus/pci/devices/0000:64:00.0` is **gone** (dGPU removed from the bus).
-
-#### ⚠️ supergfxd's logout-switching does NOT complete under greetd
-
-`supergfxctl -m <mode>` only *arms* the switch and then waits for a full graphical logout
-(`action: WaitLogout`, 30 s timeout). Under **greetd** that never happens — greetd immediately
-respawns the greeter, and any lingering session (e.g. a `claude`/shell in another TTY) keeps the
-user "logged in" — so it logs `Time (30 seconds) for logout exceeded` and **aborts without
-persisting the mode**. A plain reboot then boots back into the *old* mode (the pending switch was
-never written to `/etc/supergfxd.conf`). Two ways that actually work:
-
-1. **From a TTY, stop the graphical session first** (what `scripts/gpu-mode.sh` does):
-   `systemctl stop greetd` → kill the orphaned `niri`/clients + `systemctl stop nvidia-powerd`
-   → `modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia` → `systemctl restart supergfxd`
-   (it now removes the dGPU and writes mode=Integrated) → `systemctl start greetd`.
-2. **Edit the config + reboot:** set `"mode": "Integrated"` in `/etc/supergfxd.conf` while
-   `supergfxd` is stopped, then reboot — supergfxd applies the mode at boot, before any session
-   holds the dGPU.
-
-After either path, the **DMS bar race (issue #5)** usually fires because niri got restarted —
-fix with `scripts/dms-restart.sh`.
+The old `scripts/gpu-mode.sh` (a TTY session-teardown switcher needed for supergfxctl under
+greetd) is **retired** — cardwire needs none of it. The DMS-bar-after-restart fix (issue #5)
+still applies if you ever hand-restart niri/greetd.
 
 ### 8. Boot logos — CachyOS splash (removed) + ROG firmware animation (EFI-var experiment)
 
@@ -247,19 +243,23 @@ Two separate logos at startup, two different layers. **Full write-up:**
 linux-asus-g14-ga403wr/
 ├── README.md
 ├── docs/
-│   ├── nvidia-suspend-path-b.md   # why we use the kernel-notifier path + sources (issue #1)
-│   └── rog-boot-logo-efivar.md    # remove CachyOS splash + ROG firmware animation (issue #8)
+│   ├── nvidia-suspend-path-b.md              # kernel-notifier path + sources (issue #1)
+│   ├── nvidia-pegp-dnotifier-s2idle-wedge.md # long-sleep wedge root cause + fix (issue #2)
+│   └── rog-boot-logo-efivar.md               # remove CachyOS splash + ROG animation (issue #8)
 ├── scripts/
 │   ├── disable-rog-boot-animation.sh  # toggle the ROG boot animation EFI var (issue #8)
 │   ├── dms-restart.sh       # bring back the DMS bar/launcher after a restart (issue #5)
-│   ├── gpu-mode.sh          # switch Integrated <-> Hybrid the way that works under greetd (issue #7)
 │   └── verify-suspend.sh    # check the suspend/hibernate config is intact (issues #1, #2)
 └── configs/                 # sanitized snapshots of the working config (machine-specific!)
     ├── modprobe.d/nvidia-power.conf
     ├── modprobe.d/nvidia-drm.conf
     ├── initcpio/install/nvidia-noinitramfs  # keeps nvidia out of the initramfs (issue #1)
+    ├── tmpfiles.d/pm-debug.conf             # persist pm_debug_messages=1 (issue #2 diag)
     ├── default/limine.cmdline
     └── systemd/
-        ├── logind.conf.d/10-lid-hibernate.conf
-        └── sleep.conf.d/10-hibernate-delay.conf
+        ├── logind.conf.d/10-lid-hibernate.conf   # lid close -> hibernate (issue #2)
+        ├── system/systemd-suspend.service.d/20-freeze-user-sessions.conf  # re-freeze sessions (issue #2)
+        └── system-sleep/
+            ├── 80-nvidia-teardown.sh      # unload nvidia before sleep, reload after (issue #2)
+            └── 90-s0ix-debug-log.sh       # log s0ix residency/wakes per transition (issue #2 diag)
 ```

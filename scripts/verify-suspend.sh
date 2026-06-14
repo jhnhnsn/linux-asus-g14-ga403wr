@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# verify-suspend.sh — sanity-check the s2idle / suspend-then-hibernate config on the G14.
-# Covers README issues #1 (short-cycle resume) and #2 (long-suspend hibernate),
+# verify-suspend.sh — sanity-check the s2idle / hibernate config on the G14.
+# Covers README issues #1 (short-cycle resume) and #2 (lid-close hibernate),
 # including the btrfs swapfile single-extent + matching-offset checks.
 # Read-only: makes no changes. Run as your normal user (a couple of checks use
 # `sudo -n` to read the 0600 swapfile; they degrade to a '?' hint without sudo).
@@ -27,10 +27,10 @@ check "eDP PSR disabled on cmdline (amdgpu.dcdebugmask=0x10)" \
     "grep -q 'amdgpu.dcdebugmask=0x10' /proc/cmdline"
 check "resume= present on cmdline"        "grep -q 'resume=' /proc/cmdline"
 check "resume_offset present on cmdline"  "grep -q 'resume_offset=' /proc/cmdline"
-check "lid switch = suspend-then-hibernate" \
-    "grep -rqi 'HandleLidSwitch=suspend-then-hibernate' /etc/systemd/logind.conf.d/ 2>/dev/null"
-check "HibernateDelaySec configured" \
-    "grep -rqi 'HibernateDelaySec=' /etc/systemd/sleep.conf.d/ 2>/dev/null"
+check "lid switch = hibernate" \
+    "grep -rqi 'HandleLidSwitch=hibernate' /etc/systemd/logind.conf.d/ 2>/dev/null"
+check "nvidia-teardown sleep hook installed" \
+    "test -x /usr/lib/systemd/system-sleep/80-nvidia-teardown.sh"
 check "swap active (for hibernate)" "test -n \"\$(swapon --noheadings 2>/dev/null)\""
 
 echo "== Hibernation swapfile contiguity (issue #2 ⚠️) =="
