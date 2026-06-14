@@ -224,6 +224,21 @@ never written to `/etc/supergfxd.conf`). Two ways that actually work:
 After either path, the **DMS bar race (issue #5)** usually fires because niri got restarted —
 fix with `scripts/dms-restart.sh`.
 
+### 8. Boot logos — CachyOS splash (removed) + ROG firmware animation (EFI-var experiment)
+
+Two separate logos at startup, two different layers. **Full write-up:**
+[`docs/rog-boot-logo-efivar.md`](docs/rog-boot-logo-efivar.md).
+
+- **CachyOS logo** (lower-center, with spinner) = the **Plymouth** splash, fired by the `splash`
+  token on the kernel cmdline. **Removed** by deleting `splash` from `KERNEL_CMDLINE[default]` in
+  `/etc/default/limine` (issue #4) + `sudo limine-update`. Different layer from the ROG logo.
+- **ROG animation + chime** (the instant you power on) = **firmware**, before the kernel — no
+  cmdline/Plymouth fix possible. Signed BIOS capsules block the logo-swap-and-reflash mod, so the
+  only OS-side lever is a UEFI variable: `AsusAnimationSetupConfig` (attrs `0x07` = NV+BS+**Runtime**,
+  data `00 01 00` — middle byte looks like an enable flag). **Experiment, not yet tested** — flip
+  it with [`scripts/disable-rog-boot-animation.sh`](scripts/disable-rog-boot-animation.sh) (backs up
+  the bytes first; `--restore` to revert).
+
 ---
 
 ## Repo layout
@@ -232,8 +247,10 @@ fix with `scripts/dms-restart.sh`.
 linux-asus-g14-ga403wr/
 ├── README.md
 ├── docs/
-│   └── nvidia-suspend-path-b.md   # why we use the kernel-notifier path + sources (issue #1)
+│   ├── nvidia-suspend-path-b.md   # why we use the kernel-notifier path + sources (issue #1)
+│   └── rog-boot-logo-efivar.md    # remove CachyOS splash + ROG firmware animation (issue #8)
 ├── scripts/
+│   ├── disable-rog-boot-animation.sh  # toggle the ROG boot animation EFI var (issue #8)
 │   ├── dms-restart.sh       # bring back the DMS bar/launcher after a restart (issue #5)
 │   ├── gpu-mode.sh          # switch Integrated <-> Hybrid the way that works under greetd (issue #7)
 │   └── verify-suspend.sh    # check the suspend/hibernate config is intact (issues #1, #2)

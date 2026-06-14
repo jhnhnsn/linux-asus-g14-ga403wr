@@ -11,7 +11,9 @@
 #                    The swapfile must also be a single contiguous extent or resume fails
 #                    with `resume failed (-5)` — see README issue #2's ⚠️ callout.
 
-KERNEL_CMDLINE[default]+="quiet nowatchdog splash rw rootflags=subvol=/@ root=UUID=50bc7425-0440-496b-b77f-ff8270744621"
+# `splash` (Plymouth/CachyOS boot logo) intentionally removed — see README issue #8. Re-add it
+# here + `sudo limine-update` to bring the splash back.
+KERNEL_CMDLINE[default]+="quiet nowatchdog rw rootflags=subvol=/@ root=UUID=50bc7425-0440-496b-b77f-ff8270744621"
 
 # s2idle long-suspend fix (README issue #2): disable eDP PSR + enable hibernate resume (btrfs swapfile)
 KERNEL_CMDLINE[default]+=" amdgpu.dcdebugmask=0x10 resume=UUID=50bc7425-0440-496b-b77f-ff8270744621 resume_offset=23799040"
