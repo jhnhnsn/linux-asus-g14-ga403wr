@@ -235,6 +235,28 @@ Two separate logos at startup, two different layers. **Full write-up:**
   it with [`scripts/disable-rog-boot-animation.sh`](scripts/disable-rog-boot-animation.sh) (backs up
   the bytes first; `--restore` to revert).
 
+### 9. amdgpu iGPU MES / graphics-ring wedge on resume — known issue, no proven fix
+
+Separate from the nvidia suspend bug (issues #1/#2). The **amdgpu iGPU itself** (Radeon 890M =
+**gfx1150**) intermittently wedges its MES (MicroEngine Scheduler) + graphics-ring reset path →
+**black screen on resume**:
+```
+amdgpu 0000:65:00.0: ring gfx_0.0.0 timeout ... → MES failed to respond to msg=RESET
+→ reset via MES failed ... → Ring gfx_0.0.0 reset failed → GPU reset begin! (loops)
+```
+niri (on Mesa/amdgpu) then `SIGABRT`s in `dri_create_fence_fd` and the session is lost. **No disk
+corruption** — it's pure GPU state.
+
+It is **not** suspend-specific — the same signature reproduces on this exact silicon under pure
+compute load — so it's a general gfx11 MES/graphics-ring reset-path fragility that AMD is still
+reworking upstream. **As of June 2026 there is no proven parameter cure.** Crucially, do **not**
+chase `amdgpu.cwsr_enable=0` (a compute-path knob, unproven here), `amdgpu.mes=0` (no-op on
+gfx11+), or `amdgpu.gpu_recovery=0` (makes it worse). The right posture is already in place:
+hibernate-on-lid, a current kernel + MES firmware (past the bad MES `0x83` onto `0x86+`), GPU
+recovery left on, and updating the kernel to pick up the ongoing reset-path fixes. If it black-
+screens, switch to a TTY (**Ctrl+Alt+F2**) rather than hitting power. **Full analysis + sources:**
+[`docs/amdgpu-mes-graphics-ring-wedge.md`](docs/amdgpu-mes-graphics-ring-wedge.md).
+
 ---
 
 ## Repo layout
@@ -245,6 +267,7 @@ linux-asus-g14-ga403wr/
 ├── docs/
 │   ├── nvidia-suspend-path-b.md              # kernel-notifier path + sources (issue #1)
 │   ├── nvidia-pegp-dnotifier-s2idle-wedge.md # long-sleep wedge root cause + fix (issue #2)
+│   ├── amdgpu-mes-graphics-ring-wedge.md     # amdgpu iGPU MES wedge, no proven fix (issue #9)
 │   └── rog-boot-logo-efivar.md               # remove CachyOS splash + ROG animation (issue #8)
 ├── scripts/
 │   ├── disable-rog-boot-animation.sh  # toggle the ROG boot animation EFI var (issue #8)
