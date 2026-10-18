@@ -125,7 +125,8 @@ wake. Full analysis + method: [`docs/nvidia-pegp-dnotifier-s2idle-wedge.md`](doc
 > Xid 31 → **Xid 154 (reboot required)**. That happened 2026-08-07 and 2026-10-18, both times
 > with `nvidia_mods=4/5` in `/var/log/suspend-s0ix.log`. **Replaced by the fail-closed
 > [g14-diag sleep guard](diag/README.md)**: a oneshot service the sleep units *Require*, which
-> refuses the sleep and tells you which process holds the GPU. See #11 for why it was held.
+> refuses the sleep and tells you which process holds the GPU. See #11 for why it was held
+> (dGPU-direct MUX, niri opening the NVIDIA card, and cardwired).
 
 > ⚠️ Hibernate powers the machine **off** — press the **power button** to boot back and
 > resume (same `boot_id`, session intact).
@@ -340,14 +341,27 @@ for c in /sys/class/drm/card*-eDP-*; do echo "$c $(cat $c/status)"; done
 g14-diag status        # also shows which GPU drives the panel and who holds /dev/nvidia*
 ```
 
-**Fix (pending on this machine):** set the MUX back to hybrid, either in BIOS (GPU mode →
+**Fix (verified 2026-10-18):** set the MUX back to hybrid, either in BIOS (GPU mode →
 Optimus/Standard) or with `asusctl armoury set gpu_mux_mode 1`, then do a **full power-off
-boot**. Then verify:
+boot**. Hybrid alone wasn't enough. Two more things still held `/dev/nvidia0`:
+- **niri** picks card0 = NVIDIA even in hybrid, because the iGPU has no `boot_vga`. Even with
+  `render-drm-device` pointing at the iGPU, it still opens NVIDIA as a secondary output GPU.
+  Both lines are needed in the `debug {}` block of `config.kdl`:
+  ```kdl
+  render-drm-device "/dev/dri/by-path/pci-0000:65:00.0-render"   // AMD iGPU
+  ignore-drm-device "/dev/dri/by-path/pci-0000:64:00.0-render"   // NVIDIA: costs dGPU-wired outputs (HDMI)
+  ```
+- **cardwired** (cardwire 0.12.3) keeps `/dev/nvidia0` open in *every* mode, `integrated`
+  included, and restarts `nvidia-powerd` itself. The guard now stops `cardwired` and
+  `nvidia-powerd` before the unload and restarts both on resume.
+
+Then verify:
 - panel on `eDP-1` / amdgpu
-- niri logs `renderD128`
-- nothing holds `/dev/nvidia*` at idle
+- niri logs `renderD128` and `node is ignored` for NVIDIA
+- nothing holds `/dev/nvidia*` at idle except cardwired/nvidia-powerd (`sudo fuser -v /dev/nvidia*`)
 - dGPU `runtime_status` = `suspended`
-- the next sleep logs `pre … nvidia_mods=0`
+- the next sleep logs `pre … nvidia_mods=0`, and `/sys/power/suspend_stats/last_hw_sleep`
+  ≈ the time asleep. First clean run: 71.1 s of s0ix in a 71.0 s suspend, with no NVRM/Xid errors.
 
 Install the [g14-diag sleep guard](diag/README.md) with it, so that if anything pins the dGPU
 (a game, Ollama, a dGPU-wired monitor), the sleep is refused instead of wedging. Hybrid

@@ -260,7 +260,7 @@ note() {
 reload_nvidia() {
   modprobe nvidia_drm 2>/dev/null; modprobe nvidia_uvm 2>/dev/null
   modprobe nvidia_wmi_ec_backlight 2>/dev/null
-  systemctl start --no-block nvidia-powerd.service 2>/dev/null
+  systemctl start --no-block nvidia-powerd.service cardwired.service 2>/dev/null
 }
 guard_pre() {
   need_root guard
@@ -270,7 +270,9 @@ guard_pre() {
   loaded=$(nv_loaded_version); disk=$(nv_disk_version)
   [ "$loaded" != "$disk" ] && why="NVIDIA $loaded is loaded but ${disk:-no module} is installed — reboot first"
   if [ -z "$why" ]; then
-    systemctl stop nvidia-powerd.service 2>/dev/null
+    # cardwired keeps /dev/nvidia0 open in every mode (and restarts nvidia-powerd itself),
+    # so it has to go first or the unload below can never succeed.
+    systemctl stop cardwired.service nvidia-powerd.service 2>/dev/null
     for m in $NV_MODULES; do modprobe -r "$m" 2>/dev/null; done
     n=$(lsmod | grep -c '^nvidia')
     log "nvidia-teardown pre (sleep): nvidia_mods=$n"
