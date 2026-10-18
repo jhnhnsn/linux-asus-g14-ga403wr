@@ -146,10 +146,12 @@ collect() {
   local J="journalctl -b $boot -q --no-pager -o short-iso-precise"
 
   # How did it end?
-  tailend=$(journalctl -b "$boot" -n 80 -q --no-pager -o cat)
+  tailend=$(journalctl -b "$boot" -n 400 -q --no-pager -o cat)
   if find /var/lib/systemd/pstore -mindepth 1 -newer "$DIAG_DIR/.pstore-stamp" 2>/dev/null | grep -q . ; then
     verdict="KERNEL PANIC (pstore record captured)"; bad=1
-  elif grep -qE 'Journal stopped|Reached target .*(Power-Off|Reboot|Halt|Shutdown)|systemd-shutdown' <<<"$tailend"; then
+  # journald often stops persisting before "Reached target Power-Off", so the last thing on disk
+  # can be the unmount sequence. Any of these only happen during an orderly shutdown.
+  elif grep -qE 'Journal stopped|Reached target .*(Power-Off|Reboot|Halt|Shutdown)|systemd-shutdown|Stopped target Local File Systems|Unmounted /home|root\.mount: Deactivated' <<<"$tailend"; then
     verdict="clean shutdown/reboot"
   else
     verdict="HARD RESET or power loss (journal ends with no shutdown sequence)"; bad=1
