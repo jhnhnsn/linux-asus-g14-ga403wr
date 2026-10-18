@@ -1,0 +1,14 @@
+# Build a diagnostic bundle for the previous boot (how it ended + the evidence).
+[Unit]
+Description=g14-diag: collect diagnostics for the previous boot
+After=systemd-journal-flush.service systemd-pstore.service local-fs.target
+Wants=systemd-pstore.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/g14-diag collect -1
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

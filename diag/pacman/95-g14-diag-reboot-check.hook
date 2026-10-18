@@ -1,0 +1,14 @@
+# Warn (terminal + desktop) when an upgrade replaces the running kernel or NVIDIA driver.
+# Sleeping before rebooting wedged the dGPU on 2026-10-18 (README issue #12).
+[Trigger]
+Operation = Upgrade
+Operation = Install
+Operation = Remove
+Type = Package
+Target = nvidia*
+Target = linux*
+
+[Action]
+Description = g14-diag: checking whether a reboot is needed before sleep...
+When = PostTransaction
+Exec = /usr/local/bin/g14-diag reboot-check

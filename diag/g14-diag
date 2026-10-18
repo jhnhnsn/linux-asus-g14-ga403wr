@@ -1,0 +1,361 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# g14-diag — closed-loop diagnostics for the ASUS ROG Zephyrus G14 (GA403WR) on Linux.
+#
+# Every boot, `collect` writes a plain-text bundle describing how the PREVIOUS boot ended
+# (clean / hard reset / panic / died mid-sleep) plus the evidence that matters on this
+# machine: NVIDIA Xid errors, amdgpu ring timeouts, sleep cycles, nvidia_mods teardown
+# results, package upgrades, pstore crash records. `guard` replaces the old fail-open
+# 80-nvidia-teardown.sh sleep hook with one that REFUSES to sleep when nvidia can't be
+# unloaded. `watch` raises a desktop notification the moment a GPU fault appears.
+#
+# Bundles stay LOCAL (they contain full logs). Nothing here uploads anything.
+# See diag/README.md.
+
+set -u
+CONF=/etc/g14-diag.conf
+DIAG_DIR=/var/log/g14-diag
+DIAG_GROUP=wheel
+RETENTION_DAYS=60
+GUARD_MODE=enforce          # enforce = refuse sleep if nvidia stays loaded; warn = notify only
+TAIL_LINES=300
+NOISE_FILTER='UFW BLOCK'    # dropped from tail.log (firewall spam drowns everything else)
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+SLEEP_LOG=/var/log/suspend-s0ix.log
+RUN_DIR=/run/g14-diag
+NV_MODULES="nvidia_drm nvidia_uvm nvidia_modeset nvidia_wmi_ec_backlight nvidia"
+# Kernel lines worth an alarm. Xid alone is noisy-but-real on this machine (see README #11/#12).
+ALARM_RE='NVRM: Xid|uvm encountered global fatal error|GPU has fallen off the bus|RmInitAdapter failed|amdgpu.*ring .* timeout|amdgpu.*GPU reset begin|MES failed to respond|blocked for more than|soft lockup|hard LOCKUP|BUG:|Oops|general protection fault|Machine check|Out of memory: Killed'
+# Xids that mean "this GPU is wedged until reboot" rather than "one app misbehaved".
+FATAL_XIDS=' 31 43 48 61 62 63 64 74 79 94 95 109 119 120 143 154 '
+
+die()  { echo "g14-diag: $*" >&2; exit 1; }
+need_root() { [ "$(id -u)" -eq 0 ] || die "$1 needs root (sudo g14-diag $1)"; }
+ts()   { date '+%F %T'; }
+log()  { echo "$(ts) $*" >> "$SLEEP_LOG" 2>/dev/null; logger -t g14-diag -- "$*"; }
+
+# ---------------------------------------------------------------- notifications
+# Notify every active graphical session. Works from root (sleep guard, pacman hook) and
+# from the user (watcher).
+notify() {
+  local title=$1 body=$2 urgency=${3:-critical}
+  if [ "$(id -u)" -ne 0 ]; then
+    notify-send -a g14-diag -u "$urgency" "$title" "$body" 2>/dev/null
+    return
+  fi
+  local s type active name uid
+  for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+    type=$(loginctl show-session "$s" -p Type --value 2>/dev/null)
+    active=$(loginctl show-session "$s" -p Active --value 2>/dev/null)
+    name=$(loginctl show-session "$s" -p Name --value 2>/dev/null)
+    case "$type" in wayland|x11) ;; *) continue ;; esac
+    [ "$active" = yes ] || continue
+    uid=$(id -u "$name" 2>/dev/null) || continue
+    runuser -u "$name" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+      notify-send -a g14-diag -u "$urgency" "$title" "$body" 2>/dev/null &
+  done
+  wait
+}
+
+# ---------------------------------------------------------------- machine state
+nv_loaded_version() { grep -oE '[0-9]+\.[0-9]+\.[0-9]+' /proc/driver/nvidia/version 2>/dev/null | head -1; }
+nv_disk_version()   { modinfo -F version nvidia 2>/dev/null; }
+nv_pci() {
+  local d
+  for d in /sys/bus/pci/devices/*; do
+    [ "$(cat "$d/vendor" 2>/dev/null)" = 0x10de ] || continue
+    case "$(cat "$d/class" 2>/dev/null)" in 0x03*) basename "$d"; return ;; esac
+  done
+}
+mux_mode() {
+  local f
+  for f in /sys/class/firmware-attributes/*/attributes/gpu_mux_mode/current_value \
+           /sys/devices/platform/asus-nb-wmi/gpu_mux_mode; do
+    [ -r "$f" ] && { cat "$f"; return; }
+  done
+}
+# Processes holding the NVIDIA GPU open (/dev/nvidia* or the dGPU's DRM nodes).
+nv_holders() {
+  local pci nodes p fds
+  pci=$(nv_pci)
+  nodes='/dev/nvidia'
+  if [ -n "$pci" ]; then
+    for n in /dev/dri/by-path/pci-"$pci"-card /dev/dri/by-path/pci-"$pci"-render; do
+      [ -e "$n" ] && nodes="$nodes|$(readlink -f "$n")"
+    done
+  fi
+  for p in /proc/[0-9]*; do
+    fds=$(ls -l "$p/fd" 2>/dev/null | grep -oE "($nodes)[^ ]*" | sort -u | tr '\n' ' ')
+    [ -n "$fds" ] && echo "$(cat "$p/comm" 2>/dev/null) pid=${p#/proc/}: $fds"
+  done
+}
+
+state() {
+  local pci mux kver loaded disk c drv
+  kver=$(uname -r)
+  echo "kernel           : $kver$([ -d "/usr/lib/modules/$kver" ] || echo '  !! modules for running kernel REMOVED (upgraded, reboot needed)')"
+  loaded=$(nv_loaded_version); disk=$(nv_disk_version)
+  echo "nvidia loaded    : ${loaded:-not loaded}"
+  echo "nvidia on disk   : ${disk:-none}"
+  if [ -n "$loaded" ] && [ "$loaded" != "$disk" ]; then
+    echo "                   !! MISMATCH: driver upgraded without reboot — do not sleep, reboot"
+  fi
+  mux=$(mux_mode)
+  case "$mux" in
+    0) echo "gpu_mux_mode     : 0 = dGPU-direct (NVIDIA drives the panel; nvidia can't be unloaded)";;
+    1) echo "gpu_mux_mode     : 1 = hybrid (AMD iGPU drives the panel)";;
+    *) echo "gpu_mux_mode     : ${mux:-unknown}";;
+  esac
+  for c in /sys/class/drm/card*-eDP-*; do
+    [ "$(cat "$c/status" 2>/dev/null)" = connected ] || continue
+    drv=$(basename "$(readlink -f "$c/device/device/driver")")
+    echo "internal panel   : $(basename "$c") on $drv"
+  done
+  pci=$(nv_pci)
+  [ -n "$pci" ] && echo "dGPU power       : $(cat /sys/bus/pci/devices/"$pci"/power/runtime_status 2>/dev/null) ($pci)"
+  echo "nvidia modules   : $(lsmod | awk '/^nvidia/{printf "%s(%s) ", $1, $3}')"
+  echo "sleep            : mem_sleep=$(cat /sys/power/mem_sleep 2>/dev/null)  disk=$(cat /sys/power/disk 2>/dev/null)"
+  echo "journald         : $(systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -E '^(SystemMaxUse|SyncIntervalSec)=' | tr '\n' ' ')"
+  echo "pstore archiving : $(systemctl is-enabled systemd-pstore.service 2>/dev/null || true)"
+  local g; g=$(systemctl is-enabled g14-nvidia-teardown.service 2>/dev/null); [ "$g" = enabled ] || g="not installed (old fail-open hook: $([ -x /usr/lib/systemd/system-sleep/80-nvidia-teardown.sh ] && echo present || echo absent))"
+  echo "sleep guard      : $g, mode=$GUARD_MODE"
+  [ -e "$RUN_DIR/reboot-required" ] && echo "                   !! reboot required: $(cat "$RUN_DIR/reboot-required")"
+  echo "--- processes holding the NVIDIA GPU$([ "$(id -u)" -ne 0 ] && echo ' (only yours; run as root for all)')"
+  nv_holders | sed 's/^/  /'
+}
+
+# ---------------------------------------------------------------- collect
+# Bundle for one previous boot. Run at boot by g14-diag-collect.service.
+collect() {
+  need_root collect
+  local idx=${1:--1} force=${2:-}
+  local boot first last first_t last_t name dir verdict bad=0 tailend sleepline
+  boot=$(journalctl --list-boots --no-pager 2>/dev/null | awk -v i="$idx" '$1==i{print $2}')
+  [ -n "$boot" ] || { echo "no boot $idx in the journal"; return 0; }
+  first=$(journalctl -b "$boot" -q --no-pager -o short-unix | head -1 | cut -d' ' -f1)
+  last=$(journalctl -b "$boot" -n1 -q --no-pager -o short-unix | cut -d' ' -f1)
+  first_t=$(date -d "@${first%.*}" '+%F %T'); last_t=$(date -d "@${last%.*}" '+%F %T')
+  name="$(date -d "@${last%.*}" '+%Y%m%d-%H%M')_boot-${boot:0:8}"
+  dir="$DIAG_DIR/$name"
+  if [ -d "$dir" ] && [ "$force" != --force ]; then echo "already collected: $dir"; return 0; fi
+  install -d -m 2770 -g "$DIAG_GROUP" "$DIAG_DIR" "$dir" "$DIAG_DIR/live"
+  local J="journalctl -b $boot -q --no-pager -o short-iso-precise"
+
+  # How did it end?
+  tailend=$(journalctl -b "$boot" -n 80 -q --no-pager -o cat)
+  if find /var/lib/systemd/pstore -mindepth 1 -newer "$DIAG_DIR/.pstore-stamp" 2>/dev/null | grep -q . ; then
+    verdict="KERNEL PANIC (pstore record captured)"; bad=1
+  elif grep -qE 'Journal stopped|Reached target .*(Power-Off|Reboot|Halt|Shutdown)|systemd-shutdown' <<<"$tailend"; then
+    verdict="clean shutdown/reboot"
+  else
+    verdict="HARD RESET or power loss (journal ends with no shutdown sequence)"; bad=1
+  fi
+  sleepline=$($J -k -g 'PM: suspend (entry|exit)|PM: hibernation: (entry|exit)' | tail -1)
+  case "$sleepline" in
+    *"suspend entry"*|*"hibernation: entry"*) [ $bad = 1 ] && verdict="$verdict — died DURING sleep/resume";;
+    *exit*)
+      local sx; sx=$(date -d "$(cut -d' ' -f1 <<<"$sleepline")" +%s 2>/dev/null)
+      [ $bad = 1 ] && [ -n "$sx" ] && [ $(( ${last%.*} - sx )) -lt 600 ] && \
+        verdict="$verdict — $(( ${last%.*} - sx ))s after resuming from sleep";;
+  esac
+
+  # Evidence files
+  $J -n "$TAIL_LINES" | grep -vE "$NOISE_FILTER" > "$dir/tail.log"
+  $J -k -g "$ALARM_RE|NVRM|amdgpu.*(error|fail|timeout)|Failed to allocate NVKMS|API mismatch|Direct firmware load .* failed" \
+    | head -n 3000 > "$dir/kernel-errors.log"
+  $J -g 'PM: suspend (entry|exit)|Timekeeping suspended|suspend requested|Lid (opened|closed)|Power key pressed|Performing sleep|returned from sleep|hibernation: (entry|exit)|Dependency failed|g14-diag' \
+    > "$dir/sleep.log"
+  awk -v a="$first_t" -v b="$last_t" '{t=substr($0,1,19)} t>=a && t<=b' "$SLEEP_LOG" 2>/dev/null \
+    | grep -E 'nvidia-teardown|g14-diag|refus' > "$dir/nvidia-teardown.log"
+  awk -v a="${first_t/ /T}" -v b="${last_t/ /T}" '{t=substr($0,2,19)} t>=a && t<=b' /var/log/pacman.log 2>/dev/null \
+    | grep -E 'upgraded|installed|removed|downgraded' > "$dir/packages.log"
+  coredumpctl list --no-pager --since "$first_t" --until "$last_t" > "$dir/coredumps.txt" 2>&1
+  if [ $bad = 1 ]; then
+    mkdir -p "$dir/pstore"
+    find /var/lib/systemd/pstore -mindepth 1 -newer "$DIAG_DIR/.pstore-stamp" -type f \
+      -exec cp --parents -t "$dir/pstore" {} + 2>/dev/null
+  fi
+  touch "$DIAG_DIR/.pstore-stamp"
+  state > "$dir/state-at-next-boot.txt" 2>&1
+
+  # Summary (this is what gets shown to a human / an AI first — keep it short)
+  local xids fatal="" x mism nvver upg
+  xids=$(grep -oE 'Xid \(PCI:[^)]*\): [0-9]+' "$dir/kernel-errors.log" | awk '{print $NF}' | sort -n | uniq -c | awk '{printf "Xid %s ×%s, ", $2, $1}')
+  for x in $(grep -oE 'Xid \(PCI:[^)]*\): [0-9]+' "$dir/kernel-errors.log" | awk '{print $NF}' | sort -u); do
+    [[ "$FATAL_XIDS" == *" $x "* ]] && fatal="$fatal $x"
+  done
+  [ -n "$fatal" ] && bad=1
+  mism=$(grep -c 'API mismatch' "$dir/kernel-errors.log")
+  nvver=$($J -k -g 'NVRM: loading NVIDIA' | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  upg=$(grep -E ' (nvidia|linux|mesa)' "$dir/packages.log" | sed -E 's/^\[([^]]*)\].*\] /\1 /' | head -8)
+  {
+    echo "g14-diag bundle $name"
+    echo "boot      : $boot ($first_t → $last_t)"
+    echo "VERDICT   : $verdict"
+    local kv; kv=$($J -k -g 'Linux version' | head -1 | grep -oE 'Linux version [^ ]+' | cut -d' ' -f3)
+    echo "kernel    : ${kv:-?}   nvidia loaded at boot: ${nvver:-?}$([ -z "$kv" ] && echo '   (start of this boot already rotated out of the journal)')"
+    echo "sleep     : $(grep -c 'suspend entry' "$dir/sleep.log") suspend(s), $(grep -c 'hibernation: entry' "$dir/sleep.log") hibernate(s); last: ${sleepline:-none}"
+    echo "teardown  : $(grep -oE '(pre|post) +\([a-z-]+\): nvidia_mods=[0-9]+' "$dir/nvidia-teardown.log" | awk '{print $1, $NF}' | sort | uniq -c | awk '{printf "%s %s ×%s; ", $2, $3, $1}')(healthy: pre nvidia_mods=0)"
+    grep -q REFUSED "$dir/nvidia-teardown.log" && echo "guard     : $(grep -c REFUSED "$dir/nvidia-teardown.log") sleep(s) refused — $(grep REFUSED "$dir/nvidia-teardown.log" | tail -1 | cut -c21-)"
+    echo "GPU faults: ${xids:-none}$([ -n "$fatal" ] && echo " — FATAL Xid:$fatal")"
+    [ "$mism" -gt 0 ] && echo "!! $mism NVRM 'API mismatch' lines — userspace driver upgraded under a running module (reboot needed)"
+    echo "amdgpu    : $(grep -cE 'amdgpu.*(timeout|GPU reset|MES failed)' "$dir/kernel-errors.log") ring-timeout/reset lines"
+    echo "lockups   : $(grep -cE 'blocked for more than|soft lockup|hard LOCKUP|BUG:|Oops' "$dir/kernel-errors.log") hung-task/lockup/BUG lines"
+    echo "coredumps : $(grep -cE '^[A-Z][a-z]{2} ' "$dir/coredumps.txt")"
+    [ -n "$upg" ] && { echo "packages upgraded during this boot (no reboot after):"; sed 's/^/  /' <<<"$upg"; }
+    echo "last kernel/GPU lines before the end:"
+    grep -E "$ALARM_RE|NVRM|amdgpu" "$dir/kernel-errors.log" | grep -v '^ ' | tail -5 | cut -c1-220 | sed 's/^/  /'
+    echo "last 5 log lines:"
+    grep -v '^ ' "$dir/tail.log" | tail -5 | cut -c1-220 | sed 's/^/  /'
+  } > "$dir/summary.txt"
+  [ $bad = 1 ] && touch "$dir/.bad"
+  chgrp -R "$DIAG_GROUP" "$dir"; chmod -R g+rwX "$dir"
+  ln -sfn "$name" "$DIAG_DIR/latest"
+  find "$DIAG_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +"$RETENTION_DAYS" ! -name live -exec rm -rf {} + 2>/dev/null
+  find "$DIAG_DIR/live" -mindepth 1 -maxdepth 1 -type d -mtime +"$RETENTION_DAYS" -exec rm -rf {} + 2>/dev/null
+  echo "$dir: $verdict"
+}
+
+# ---------------------------------------------------------------- review helpers
+pending() {
+  local mode=${1:-} d n=0
+  for d in $(ls -1dr "$DIAG_DIR"/*_boot-* 2>/dev/null); do
+    [ -e "$d/.bad" ] && [ ! -e "$d/.reviewed" ] || continue
+    n=$((n+1)); [ $n -gt 3 ] && break
+    if [ "$mode" = --claude ] && [ $n = 1 ]; then
+      echo "g14-diag: the machine had unreviewed bad boot(s). Bundles are in $DIAG_DIR (full logs: tail.log, kernel-errors.log, sleep.log, nvidia-teardown.log, packages.log, notes.txt)."
+      echo "Investigate before other work if the user is asking about stability; mark reviewed with: g14-diag ack <name>."
+    fi
+    echo; cat "$d/summary.txt"
+    [ -s "$d/notes.txt" ] && { echo "user notes:"; sed 's/^/  /' "$d/notes.txt"; }
+  done
+  local live; live=$(find "$DIAG_DIR/live" -mindepth 1 -maxdepth 1 -type d -newer "$DIAG_DIR/.acked" 2>/dev/null | wc -l)
+  [ "$live" -gt 0 ] && echo && echo "g14-diag: $live live GPU-fault snapshot(s) since last ack in $DIAG_DIR/live/"
+  return 0
+}
+ack() {
+  local t=${1:-all} d
+  if [ "$t" = all ]; then
+    for d in "$DIAG_DIR"/*_boot-*; do [ -d "$d" ] && touch "$d/.reviewed"; done
+  else
+    [ -d "$DIAG_DIR/$t" ] || die "no bundle $t"; touch "$DIAG_DIR/$t/.reviewed"
+  fi
+  touch "$DIAG_DIR/.acked"
+}
+note() {
+  [ $# -gt 0 ] || die 'usage: g14-diag note "what you saw"'
+  local d; d=$(readlink -f "$DIAG_DIR/latest") || die "no bundle yet"
+  echo "$(ts) $*" >> "$d/notes.txt" && echo "noted in $d/notes.txt"
+}
+
+# ---------------------------------------------------------------- sleep guard
+# Runs as a oneshot that systemd-{suspend,hibernate,...}.service REQUIRE, so exiting
+# non-zero aborts the sleep. (Hooks in /usr/lib/systemd/system-sleep cannot do that.)
+reload_nvidia() {
+  modprobe nvidia_drm 2>/dev/null; modprobe nvidia_uvm 2>/dev/null
+  modprobe nvidia_wmi_ec_backlight 2>/dev/null
+  systemctl start --no-block nvidia-powerd.service 2>/dev/null
+}
+guard_pre() {
+  need_root guard
+  mkdir -p "$RUN_DIR"; rm -f "$RUN_DIR/unloaded"
+  if ! lsmod | grep -q '^nvidia '; then log "nvidia-teardown pre (sleep): nvidia_mods=0 (not loaded)"; return 0; fi
+  local loaded disk n holders why=""
+  loaded=$(nv_loaded_version); disk=$(nv_disk_version)
+  [ "$loaded" != "$disk" ] && why="NVIDIA $loaded is loaded but ${disk:-no module} is installed — reboot first"
+  if [ -z "$why" ]; then
+    systemctl stop nvidia-powerd.service 2>/dev/null
+    for m in $NV_MODULES; do modprobe -r "$m" 2>/dev/null; done
+    n=$(lsmod | grep -c '^nvidia')
+    log "nvidia-teardown pre (sleep): nvidia_mods=$n"
+    [ "$n" -eq 0 ] && { touch "$RUN_DIR/unloaded"; return 0; }
+    holders=$(nv_holders | cut -d: -f1 | sort -u | tr '\n' ' ')
+    why="NVIDIA is still in use by: ${holders:-unknown} — close it (or check gpu_mux_mode)"
+    reload_nvidia
+  fi
+  if [ "$GUARD_MODE" = enforce ]; then
+    log "REFUSED sleep: $why"
+    notify "Sleep refused" "$why"
+    return 1
+  fi
+  log "WARNING (guard in warn mode, sleeping anyway): $why"
+  notify "Sleeping with NVIDIA loaded" "$why"
+  return 0
+}
+guard_post() {
+  need_root guard
+  [ -e "$RUN_DIR/unloaded" ] || return 0
+  rm -f "$RUN_DIR/unloaded"
+  reload_nvidia
+  log "nvidia-teardown post (sleep): nvidia_mods=$(lsmod | grep -c '^nvidia')"
+}
+
+# ---------------------------------------------------------------- pacman hook
+reboot_check() {
+  local kver loaded disk msg=""
+  kver=$(uname -r); loaded=$(nv_loaded_version); disk=$(nv_disk_version)
+  [ -d "/usr/lib/modules/$kver" ] || msg="kernel $kver was replaced"
+  [ -n "$loaded" ] && [ "$loaded" != "$disk" ] && msg="${msg:+$msg; }NVIDIA $loaded → ${disk:-removed}"
+  [ -n "$msg" ] || return 0
+  mkdir -p "$RUN_DIR"; echo "$msg" > "$RUN_DIR/reboot-required"
+  echo ">>> g14-diag: REBOOT before suspending or hibernating ($msg)."
+  echo ">>> The running driver's firmware may already be gone; sleeping now can wedge the dGPU."
+  notify "Reboot required" "$msg — reboot before you suspend or close the lid."
+}
+
+# ---------------------------------------------------------------- live watcher
+watch_() {
+  declare -A last
+  local line key now dir
+  journalctl -k -f -n0 -q -o short-iso --grep "$ALARM_RE" 2>/dev/null | while IFS= read -r line; do
+    key=$(grep -oE 'Xid \(PCI:[^)]*\): [0-9]+|uvm encountered|fallen off the bus|ring .* timeout|GPU reset|blocked for more|lockup|BUG|Oops|protection fault|Machine check|Out of memory' <<<"$line" | head -1 | sed -E 's/\(PCI:[^)]*\): /#/')
+    key=${key:-alarm}
+    now=$(date +%s)
+    [ $(( now - ${last[$key]:-0} )) -lt 300 ] && continue
+    last[$key]=$now
+    dir="$DIAG_DIR/live/$(date '+%Y%m%d-%H%M%S')_${key//[^A-Za-z0-9#]/_}"
+    if mkdir -p "$dir" 2>/dev/null; then
+      echo "$line" > "$dir/trigger.txt"
+      state > "$dir/state.txt" 2>&1
+      journalctl -b -n 400 -q --no-pager -o short-iso-precise | grep -vE "$NOISE_FILTER" > "$dir/journal.log"
+      local np; np=$(pidof niri | awk '{print $1}')
+      [ -n "$np" ] && { echo "niri pid $np state: $(awk '/^State/{print $2,$3}' /proc/"$np"/status) wchan: $(cat /proc/"$np"/wchan 2>/dev/null)"; } > "$dir/niri.txt"
+    fi
+    notify "GPU/kernel fault: $key" "$(cut -c1-180 <<<"${line#* * }")
+Snapshot: $dir. Consider rebooting before you suspend."
+  done
+}
+
+usage() {
+  cat <<EOF
+usage: g14-diag <command>
+  status            current health: driver versions, MUX mode, who holds the dGPU, guard state
+  pending [--claude] summaries of bad boots not yet reviewed (silent if none)
+  latest            summary of the most recent bundle
+  note "text"       add what you saw to the latest bundle (e.g. "black screen after lid open")
+  ack [name|all]    mark bundle(s) reviewed
+  collect [idx] [--force]   (root) build the bundle for boot idx (default -1)
+  guard pre|post    (root) sleep guard, run by g14-nvidia-{teardown,reload}.service
+  reboot-check      (root) pacman hook: flag an upgrade that needs a reboot
+  watch             live watcher, run by the g14-diag-watch user service
+Bundles: $DIAG_DIR   Config: $CONF
+EOF
+}
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+  status)       state ;;
+  pending)      pending "${1:-}" ;;
+  latest)       cat "$DIAG_DIR/latest/summary.txt" 2>/dev/null || die "no bundle yet"
+                [ -s "$DIAG_DIR/latest/notes.txt" ] && { echo "user notes:"; cat "$DIAG_DIR/latest/notes.txt"; } ;;
+  note)         note "$@" ;;
+  ack)          ack "${1:-all}" ;;
+  collect)      collect "${1:--1}" "${2:-}" ;;
+  guard)        case "${1:-}" in pre) guard_pre ;; post) guard_post ;; *) usage; exit 2 ;; esac ;;
+  reboot-check) reboot_check ;;
+  watch)        watch_ ;;
+  *)            usage; [ -z "$cmd" ] || [ "$cmd" = help ] || [ "$cmd" = -h ] || exit 2 ;;
+esac

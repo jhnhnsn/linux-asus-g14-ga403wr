@@ -1,0 +1,15 @@
+# Unload the NVIDIA stack before sleep so the dGPU is driverless during s2idle/S4
+# (README issues #2, #10). Unlike the old 80-nvidia-teardown.sh hook this is FAIL-CLOSED:
+# the sleep services Require it, so if nvidia is still in use (or the driver was upgraded
+# without a reboot) it exits non-zero and the sleep is refused instead of wedging the GPU.
+# Set GUARD_MODE=warn in /etc/g14-diag.conf to only notify.
+[Unit]
+Description=g14-diag: unload NVIDIA before sleep (refuse sleep if it can't)
+Before=systemd-suspend.service systemd-hibernate.service systemd-suspend-then-hibernate.service systemd-hybrid-sleep.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/g14-diag guard pre
+
+[Install]
+RequiredBy=systemd-suspend.service systemd-hibernate.service systemd-suspend-then-hibernate.service systemd-hybrid-sleep.service

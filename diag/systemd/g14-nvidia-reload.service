@@ -1,0 +1,11 @@
+# Reload the NVIDIA stack after resume (only if g14-nvidia-teardown unloaded it).
+[Unit]
+Description=g14-diag: reload NVIDIA after resume
+After=systemd-suspend.service systemd-hibernate.service systemd-suspend-then-hibernate.service systemd-hybrid-sleep.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/g14-diag guard post
+
+[Install]
+WantedBy=systemd-suspend.service systemd-hibernate.service systemd-suspend-then-hibernate.service systemd-hybrid-sleep.service
