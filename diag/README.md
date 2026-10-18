@@ -12,7 +12,7 @@ share a log in an issue, quote only the lines you need.
 
 | Layer | Piece | Effect |
 |---|---|---|
-| Don't lose evidence | `etc/journald.conf.d/50-g14-diag.conf` | journal keeps 1 GB (months) and syncs every 15 s instead of every 5 min |
+| Don't lose evidence | `etc/systemd/journald.conf.d/50-g14-diag.conf` | journal keeps 1 GB (months) and syncs every 15 s instead of every 5 min. Overrides CachyOS's default `SystemMaxUse=50M` |
 | | `systemd-pstore.service` enabled | kernel panic records saved to `/var/lib/systemd/pstore` |
 | | `etc/sysctl.d/50-g14-diag.conf` | soft lockups panic (so they leave a crash record); full Magic SysRq |
 | Prevent known wedges | `g14-nvidia-teardown.service` / `-reload.service` | **fail-closed** replacement for `80-nvidia-teardown.sh`: unloads NVIDIA before sleep and **refuses the sleep** if it can't, or if the loaded driver no longer matches the installed one |

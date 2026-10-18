@@ -413,7 +413,7 @@ linux-asus-g14-ga403wr/
 │   ├── g14-diag             # the CLI (status / pending / note / ack / collect / guard / watch)
 │   ├── install.sh           # sudo diag/install.sh [--without-guard | --uninstall]
 │   ├── systemd/             # collect-at-boot, fail-closed nvidia teardown/reload, user watcher
-│   ├── etc/                 # journald retention/sync + sysctl crash-capture drop-ins
+│   ├── etc/                 # systemd/journald.conf.d retention/sync + sysctl crash-capture drop-ins
 │   └── pacman/              # reboot-needed warning after kernel/NVIDIA upgrades
 └── configs/                 # sanitized snapshots of the working config (machine-specific!)
     ├── modprobe.d/nvidia-power.conf

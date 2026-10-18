@@ -17,7 +17,7 @@ uninstall() {
   systemctl --global disable g14-diag-watch.service 2>/dev/null || true
   rm -f /etc/systemd/system/g14-diag-collect.service /etc/systemd/system/g14-nvidia-{teardown,reload}.service \
         /etc/systemd/user/g14-diag-watch.service /etc/pacman.d/hooks/95-g14-diag-reboot-check.hook \
-        /etc/journald.conf.d/50-g14-diag.conf /etc/sysctl.d/50-g14-diag.conf /usr/local/bin/g14-diag
+        /etc/systemd/journald.conf.d/50-g14-diag.conf /etc/journald.conf.d/50-g14-diag.conf /etc/sysctl.d/50-g14-diag.conf /usr/local/bin/g14-diag
   if [ -e "$BACKUP/80-nvidia-teardown.sh" ] && [ ! -e "$OLD_HOOK" ]; then
     install -m 755 "$BACKUP/80-nvidia-teardown.sh" "$OLD_HOOK" && echo "restored $OLD_HOOK"
   fi
@@ -36,7 +36,9 @@ install -D -m 755 g14-diag /usr/local/bin/g14-diag
 install -d -m 2770 -g "${DIAG_GROUP:-wheel}" "${DIAG_DIR:-/var/log/g14-diag}" "${DIAG_DIR:-/var/log/g14-diag}/live"
 
 # 1. stop losing evidence
-install -D -m 644 etc/journald.conf.d/50-g14-diag.conf /etc/journald.conf.d/50-g14-diag.conf
+# (CachyOS ships /usr/lib/systemd/journald.conf.d/00-journal-size.conf with SystemMaxUse=50M; ours sorts later and wins)
+install -D -m 644 etc/systemd/journald.conf.d/50-g14-diag.conf /etc/systemd/journald.conf.d/50-g14-diag.conf
+rm -rf /etc/journald.conf.d/50-g14-diag.conf; rmdir /etc/journald.conf.d 2>/dev/null || true   # wrong path used by the first release
 install -D -m 644 etc/sysctl.d/50-g14-diag.conf /etc/sysctl.d/50-g14-diag.conf
 systemctl restart systemd-journald
 sysctl --system >/dev/null
