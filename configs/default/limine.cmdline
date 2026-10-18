@@ -13,7 +13,13 @@
 
 # `splash` (Plymouth/CachyOS boot logo) intentionally removed — see README issue #8. Re-add it
 # here + `sudo limine-update` to bring the splash back.
-KERNEL_CMDLINE[default]+="quiet nowatchdog rw rootflags=subvol=/@ root=UUID=50bc7425-0440-496b-b77f-ff8270744621"
+# `nowatchdog` removed (it would disable the NMI watchdog that crash capture below relies on).
+KERNEL_CMDLINE[default]+="quiet rw rootflags=subvol=/@ root=UUID=50bc7425-0440-496b-b77f-ff8270744621"
 
 # s2idle long-suspend fix (README issue #2): disable eDP PSR + enable hibernate resume (btrfs swapfile)
 KERNEL_CMDLINE[default]+=" amdgpu.dcdebugmask=0x10 resume=UUID=50bc7425-0440-496b-b77f-ff8270744621 resume_offset=23799040"
+
+# Crash capture (diag/README.md): keep panic records in EFI pstore, turn a hard CPU lockup
+# into a panic (-> record), and auto-reboot 20 s after a panic instead of sitting frozen.
+# iommu.strict=1 = strict IOMMU invalidation (rules out lazy-flush DMA corruption; small perf cost).
+KERNEL_CMDLINE[default]+=" efi_pstore.pstore_disable=0 nmi_watchdog=panic panic=20 iommu.strict=1"

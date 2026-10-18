@@ -1,19 +1,34 @@
 # linux-asus-g14-ga403wr
 
 Notes, fixes, and config snapshots for running Linux on an **ASUS ROG Zephyrus G14
-(GA403WR)** — AMD Strix Halo + NVIDIA dGPU — under **CachyOS**. This is a personal lab notebook —
+(GA403WR)** — AMD Strix Point + NVIDIA dGPU — under **CachyOS**. This is a personal lab notebook —
 every entry is something that actually broke on this machine and the fix that resolved it.
 
 > ⚠️ Machine-specific values (partition UUIDs, `resume_offset`, hostname) appear in the
 > config snapshots. They document *this* laptop — **regenerate your own** before reusing.
+
+## Current status (2026-10-18)
+
+| | |
+|---|---|
+| **Lid close** | does **not** sleep — logind ignores it, niri just blanks the panel ([`10-lid-ignore.conf`](configs/systemd/logind.conf.d/10-lid-ignore.conf)) |
+| **Suspend / hibernate** | explicit only (power key / menu). Hibernate works with `shutdown` mode (#10) |
+| **dGPU during sleep** | must be driverless. The old fail-open hook silently failed twice (#11), so it's being replaced by the fail-closed [g14-diag sleep guard](diag/README.md) |
+| **⚠️ MUX** | found in **dGPU-direct** (`gpu_mux_mode=0`): NVIDIA drives the panel, so nothing can unload it (#11). **Switching back to hybrid is the pending fix** |
+| **After every kernel/NVIDIA upgrade** | **reboot before sleeping** (#12) |
+| **Diagnostics** | [`diag/`](diag/README.md): per-boot incident bundles, live GPU-fault alerts, no lost logs |
+
+Quick health check: [`scripts/verify-suspend.sh`](scripts/verify-suspend.sh) (config) and
+`g14-diag status` (live state).
 
 ## Hardware / software baseline
 
 | | |
 |---|---|
 | **Laptop** | ASUS ROG Zephyrus G14 — model **GA403WR** (board `GA403WR`, hostname `cachyos-g14`) |
-| **APU** | AMD Strix Halo — Radeon 880M/890M **iGPU is the primary display** (`amdgpu`, `fb0`) |
-| **dGPU** | NVIDIA RTX 5070 Ti Laptop — proprietary driver, **render-offload only** |
+| **APU** | AMD Strix Point — Ryzen AI 9 HX 370 + Radeon 890M (gfx1150). **Primary display in hybrid MUX mode** (`amdgpu`, panel = `eDP-1`) |
+| **dGPU** | NVIDIA RTX 5070 Ti Laptop (Blackwell GB205M), open kernel module — **render-offload in hybrid mode**; drives the panel (`eDP-2`) in dGPU-direct mode (#11) |
+| **MUX** | `gpu_mux_mode`: `1` = hybrid, `0` = dGPU-direct. Read it: `cat /sys/class/firmware-attributes/asus-armoury/attributes/gpu_mux_mode/current_value` |
 | **Sleep** | s2idle-only (`/sys/power/mem_sleep` = `[s2idle]`) — no deep/S3 |
 | **Disk** | single btrfs partition, subvols `@` (root), `@home`, nested `@/swap` (NOCOW swapfile) |
 | **Boot** | **Limine** (not GRUB/sd-boot) |
@@ -74,7 +89,7 @@ still works.
 > by hibernating on lid close. See **issue #2** and
 > [`docs/nvidia-pegp-dnotifier-s2idle-wedge.md`](docs/nvidia-pegp-dnotifier-s2idle-wedge.md).
 
-### 2. Long/overnight s2idle wedges — root cause was nvidia; resolution is hibernate-on-lid
+### 2. Long/overnight s2idle wedges — root cause was nvidia; keep the dGPU out of sleep
 
 **Symptom:** Even after fix #1, a *long* lid-close (e.g. overnight) entered s2idle and never
 resumed — force-power required. **Short cycles were always fine; only long ones hung.** Not
@@ -92,19 +107,28 @@ wake. Full analysis + method: [`docs/nvidia-pegp-dnotifier-s2idle-wedge.md`](doc
 > so it wedged in the exact same nvidia path before it could ever escalate. Both removed.
 
 **Fix — keep the dGPU out of the sleep path:**
-- **Lid close → hibernate (S4)**, not s2idle — powers fully off, so there's no s0ix and nothing
-  pokes `PEGP`; also zero drain while closed.
-  [`configs/systemd/logind.conf.d/10-lid-hibernate.conf`](configs/systemd/logind.conf.d/10-lid-hibernate.conf):
-  `HandleLidSwitch=hibernate`, `HandleLidSwitchExternalPower=hibernate`, and
-  `HandleLidSwitchDocked` left unset (= `ignore`, so clamshell with an external monitor keeps running).
-- **Unload nvidia before any sleep** —
-  [`configs/systemd/system-sleep/80-nvidia-teardown.sh`](configs/systemd/system-sleep/80-nvidia-teardown.sh):
-  stops `nvidia-powerd` + unloads the whole nvidia stack on `pre`, reloads on `post`, **fail-open**
-  (never blocks suspend). Verified `nvidia_mods` 0→5. Also makes manual `systemctl suspend`
-  (fast s2idle) safe — the dGPU is driverless during sleep, so there's no NVRM handler to fail.
+- **Lid close does nothing to power state** (since 2026-06-16, by choice) —
+  [`configs/systemd/logind.conf.d/10-lid-ignore.conf`](configs/systemd/logind.conf.d/10-lid-ignore.conf)
+  sets `HandleLidSwitch=ignore` and niri's `switch-events` blank the panel. Suspend and hibernate
+  are explicit (power key / DMS menu). *Before that:* lid → hibernate (S4), which powers fully
+  off so nothing pokes `PEGP`. It works with issue #10's `shutdown` mode; the old config is kept
+  as a rollback in the conf file's comments.
+- **Unload nvidia before any sleep, so the dGPU is driverless.** This is the actual fix: no NVRM
+  handler means the `PEGP` notify is harmless. It was first done with
+  [`configs/systemd/system-sleep/80-nvidia-teardown.sh`](configs/systemd/system-sleep/80-nvidia-teardown.sh)
+  (stop `nvidia-powerd`, unload the stack on `pre`, reload on `post`; healthy run logs `pre …
+  nvidia_mods=0`).
 
-> ⚠️ Hibernate powers the machine **off** — opening the lid does **not** wake it; press the
-> **power button** to boot back and resume (same `boot_id`, session intact).
+> ⚠️ **The fail-open hook is a trap.** It always exits 0, and systemd-sleep hooks can't abort
+> a sleep anyway. So when the unload fails, because something still holds the GPU, the machine
+> sleeps with nvidia bound and the original wedge returns: `status=0x11` → Xid 13 storm →
+> Xid 31 → **Xid 154 (reboot required)**. That happened 2026-08-07 and 2026-10-18, both times
+> with `nvidia_mods=4/5` in `/var/log/suspend-s0ix.log`. **Replaced by the fail-closed
+> [g14-diag sleep guard](diag/README.md)**: a oneshot service the sleep units *Require*, which
+> refuses the sleep and tells you which process holds the GPU. See #11 for why it was held.
+
+> ⚠️ Hibernate powers the machine **off** — press the **power button** to boot back and
+> resume (same `boot_id`, session intact).
 
 Hibernate still depends on a correct swapfile + cmdline (next ⚠️). Kernel cmdline lives in
 [`configs/default/limine.cmdline`](configs/default/limine.cmdline) — see issue #4 for why you must
@@ -192,10 +216,11 @@ These appear every boot and are **not** problems:
 
 ### 7. dGPU off by default for daily use — now via cardwire (supergfxctl deprecated)
 
-The desktop never uses the dGPU for display — the internal panel + USB-C/DisplayPort outputs are
-all on the **amdgpu** iGPU; only the **HDMI** port is wired to the dGPU. So for everyday + USB-C
-external monitors, the Blackwell render-offload card is dead weight; keep it off and only switch
-it on for gaming.
+**In hybrid MUX mode** the desktop never uses the dGPU for display. The internal panel and most
+USB-C/DisplayPort outputs are on the **amdgpu** iGPU; the **HDMI** port (`HDMI-A-1`) and one DP
+output (`DP-9`) enumerate on the dGPU. So for everyday use and USB-C monitors, the Blackwell
+render-offload card is dead weight; keep it off and only switch it on for gaming. (In
+dGPU-direct mode none of this applies: see #11.)
 
 **supergfxctl graphics switching is deprecated upstream** (asus-linux.org). The daily switcher is
 now **cardwire** (eBPF LSM), which switches **instantly — no reboot, no logout** (supergfxctl's
@@ -214,7 +239,11 @@ Gaming: `cardwire set hybrid` → `prime-run <game>` → `cardwire set integrate
 > **cardwire only blocks the device nodes (eBPF) and leaves the nvidia driver bound.** That
 > difference is exactly why suspend kept wedging under cardwire: the bound driver still chokes on
 > the `PEGP` ACPI D-notifier during s0ix (**issue #2**). cardwire is the convenient GPU switcher;
-> the suspend problem is solved separately by **hibernating on lid close**, not by the GPU mode.
+> the suspend problem is solved separately by **unloading nvidia before every sleep**, not by the GPU mode.
+>
+> ⚠️ **cardwire's mode is software-only and does not reflect the hardware MUX.** With the MUX in
+> dGPU-direct mode, `cardwire get` still says `Hybrid` but only offers `hybrid, manual`, with no
+> `integrated`. That's the tell that NVIDIA is driving the panel (#11).
 
 The old `scripts/gpu-mode.sh` (a TTY session-teardown switcher needed for supergfxctl under
 greetd) is **retired** — cardwire needs none of it. The DMS-bar-after-restart fix (issue #5)
@@ -252,7 +281,7 @@ compute load — so it's a general gfx11 MES/graphics-ring reset-path fragility 
 reworking upstream. **As of June 2026 there is no proven parameter cure.** Crucially, do **not**
 chase `amdgpu.cwsr_enable=0` (a compute-path knob, unproven here), `amdgpu.mes=0` (no-op on
 gfx11+), or `amdgpu.gpu_recovery=0` (makes it worse). The right posture is already in place:
-hibernate-on-lid, a current kernel + MES firmware (past the bad MES `0x83` onto `0x86+`), GPU
+few sleep cycles (lid close doesn't sleep, #2), a current kernel + MES firmware (past the bad MES `0x83` onto `0x86+`), GPU
 recovery left on, and updating the kernel to pick up the ongoing reset-path fixes. If it black-
 screens, switch to a TTY (**Ctrl+Alt+F2**) rather than hitting power. **Full analysis + sources:**
 [`docs/amdgpu-mes-graphics-ring-wedge.md`](docs/amdgpu-mes-graphics-ring-wedge.md).
@@ -289,6 +318,80 @@ logs can't tell a bounce from success); session restores with `boot_id` unchange
 reboot `cat /sys/power/disk` still shows `[shutdown]`. **Full write-up:**
 [`docs/hibernate-s4-platform-bounce.md`](docs/hibernate-s4-platform-bounce.md).
 
+### 11. MUX found in dGPU-direct mode — NVIDIA drives the panel, so it can never be unloaded
+
+**Symptom:** issue #2's wedge came back (2026-08-07, 2026-10-18) even though the teardown hook
+was installed: `nvidia_mods=4/5` on every sleep, then `RmHandleDNotifierEvent ... status=0x11`
+→ Xid 13 → Xid 31 → **Xid 154**. On lid open the panel stayed black:
+`[nvidia-drm] Failed to allocate NVKMS memory for GEM object`.
+
+**Root cause:** the firmware MUX was set to **dGPU-direct** (`gpu_mux_mode=0`). The internal
+panel was wired to NVIDIA (`card*-eDP-2` connected on the `nvidia` card, `eDP-1` on amdgpu
+disconnected), niri picked NVIDIA as its primary renderer (`using as the render node:
+renderD129`), and every client followed it. With the compositor holding `nvidia_drm`
+(refcount ~30), `modprobe -r` can never succeed. The hook failed open and the machine slept
+with the dGPU bound. When the MUX changed is unknown: June 2026 was hybrid (panel on `eDP-1`),
+and logs from the switch had already rotated out. Likely culprits are a BIOS update/reset or a
+GPU-mode toggle.
+
+```bash
+cat /sys/class/firmware-attributes/asus-armoury/attributes/gpu_mux_mode/current_value  # 1 = hybrid, 0 = dGPU-direct
+for c in /sys/class/drm/card*-eDP-*; do echo "$c $(cat $c/status)"; done
+g14-diag status        # also shows which GPU drives the panel and who holds /dev/nvidia*
+```
+
+**Fix (pending on this machine):** set the MUX back to hybrid, either in BIOS (GPU mode →
+Optimus/Standard) or with `asusctl armoury set gpu_mux_mode 1`, then do a **full power-off
+boot**. Then verify:
+- panel on `eDP-1` / amdgpu
+- niri logs `renderD128`
+- nothing holds `/dev/nvidia*` at idle
+- dGPU `runtime_status` = `suspended`
+- the next sleep logs `pre … nvidia_mods=0`
+
+Install the [g14-diag sleep guard](diag/README.md) with it, so that if anything pins the dGPU
+(a game, Ollama, a dGPU-wired monitor), the sleep is refused instead of wedging. Hybrid
+trade-off: a few % of game FPS (frames are copied to the iGPU). Run games with `prime-run`.
+
+**Upstream context:**
+- NVIDIA/open-gpu-kernel-modules [#1117](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1117):
+  Blackwell s2idle resume hangs, still open on 615.71.09. One report says it fails only when the
+  MUX routes the panel to the dGPU.
+- [#1322](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1322): RTX 5070 Ti, the same
+  Xid 13 → 154 signature with `PreserveVideoMemoryAllocations=0`.
+- Hybrid's own risk is [#1064](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1064):
+  GSP/DIFR hangs when the dGPU wakes from runtime power-off (partial mitigation
+  `NVreg_DynamicPowerManagement=0x00`).
+
+### 12. Driver upgraded without a reboot → next sleep wedges the dGPU
+
+**Symptom (2026-10-18):** after a `pacman -Syu` that moved NVIDIA 615.71.09 → 615.78.08 (and
+the kernel 7.2.9 → 7.2.10), the next suspend/resume cycles logged
+`Direct firmware load for nvidia/615.71.09/gsp_ga10x.bin failed with error -2`, an Xid
+13/31/154 cascade, `uvm encountered global fatal error 0x60, requiring os reboot` and
+`NVRM: API mismatch: the client ... has the version 615.78.08, but this kernel module has the
+version 615.71.09`. Then a hard hang.
+
+**Root cause:** the still-loaded 615.71.09 module needs its GSP firmware again every time the
+GPU re-initializes (each resume), and the upgrade had **deleted** `/usr/lib/firmware/nvidia/615.71.09/`.
+New userspace tools (`nvidia-smi`, `nvidia-powerd`) also can't talk to the old module.
+
+**Fix:** reboot after any kernel or NVIDIA upgrade, **before** suspending, hibernating or
+closing the lid on a sleep-on-lid setup. [g14-diag](diag/README.md) enforces it: a pacman hook
+warns in the terminal and on the desktop, and the sleep guard refuses to sleep while the loaded
+and installed driver versions differ.
+
+### 13. Open / unexplained incidents
+
+Kept so patterns show up over time. [g14-diag](diag/README.md) bundles exist for incidents after 2026-10-18.
+
+| Date | What happened | Evidence | Status |
+|---|---|---|---|
+| 2026-08-01 | Hard lockup mid-session | `SIGILL` inside libsystemd's code pages in RAM (disk copy clean). Points to corrupted memory | overnight memtest86+ clean. Inconclusive |
+| 2026-08-05 | dGPU wedged mid-session, later hung a reboot | `/dev/nvidia0` missing | corrupt `nvidia-utils` install; fixed by reinstall + 2 reboots |
+| 2026-09-23 | Screen froze; kernel, logind and apps kept running | niri ignored the power key; no Xid/amdgpu errors | compositor hang, cause unknown. Next time: Ctrl+Alt+F3 / SSH before hard reset |
+| 2026-10-18 | Black screen on lid open, then hang after suspend cycles | issues #11 + #12 | root-caused; MUX switch pending |
+
 ---
 
 ## Repo layout
@@ -305,7 +408,13 @@ linux-asus-g14-ga403wr/
 ├── scripts/
 │   ├── disable-rog-boot-animation.sh  # toggle the ROG boot animation EFI var (issue #8)
 │   ├── dms-restart.sh       # bring back the DMS bar/launcher after a restart (issue #5)
-│   └── verify-suspend.sh    # check the suspend/hibernate config is intact (issues #1, #2)
+│   └── verify-suspend.sh    # check the suspend/hibernate config is intact (issues #1, #2, #10–#12)
+├── diag/                    # g14-diag: per-boot incident bundles, sleep guard, live alerts (diag/README.md)
+│   ├── g14-diag             # the CLI (status / pending / note / ack / collect / guard / watch)
+│   ├── install.sh           # sudo diag/install.sh [--without-guard | --uninstall]
+│   ├── systemd/             # collect-at-boot, fail-closed nvidia teardown/reload, user watcher
+│   ├── etc/                 # journald retention/sync + sysctl crash-capture drop-ins
+│   └── pacman/              # reboot-needed warning after kernel/NVIDIA upgrades
 └── configs/                 # sanitized snapshots of the working config (machine-specific!)
     ├── modprobe.d/nvidia-power.conf
     ├── modprobe.d/nvidia-drm.conf
@@ -314,9 +423,14 @@ linux-asus-g14-ga403wr/
     ├── tmpfiles.d/hibernate-shutdown-mode.conf  # force /sys/power/disk=shutdown each boot (issue #10)
     ├── default/limine.cmdline
     └── systemd/
-        ├── logind.conf.d/10-lid-hibernate.conf   # lid close -> hibernate (issue #2)
+        ├── logind.conf.d/10-lid-ignore.conf      # lid close -> no sleep, niri blanks the panel (issue #2)
         ├── system/systemd-suspend.service.d/20-freeze-user-sessions.conf  # re-freeze sessions (issue #2)
         └── system-sleep/
-            ├── 80-nvidia-teardown.sh      # unload nvidia before sleep, reload after (issue #2)
+            ├── 80-nvidia-teardown.sh      # fail-open predecessor of the g14-diag sleep guard (issue #2)
             └── 90-s0ix-debug-log.sh       # log s0ix residency/wakes per transition (issue #2 diag)
 ```
+
+## License
+
+[GPL-3.0](LICENSE). Scripts and configs are free to reuse and modify; changes you distribute
+must stay under the same license.

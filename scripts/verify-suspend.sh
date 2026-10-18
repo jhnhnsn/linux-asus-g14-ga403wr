@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # verify-suspend.sh — sanity-check the s2idle / hibernate config on the G14.
-# Covers README issues #1 (short-cycle resume) and #2 (lid-close hibernate),
+# Covers README issues #1 (short-cycle resume), #2 (dGPU out of the sleep path),
+# #10 (hibernate shutdown mode), #11 (MUX mode) and #12 (reboot after upgrades),
 # including the btrfs swapfile single-extent + matching-offset checks.
 # Read-only: makes no changes. Run as your normal user (a couple of checks use
 # `sudo -n` to read the 0600 swapfile; they degrade to a '?' hint without sudo).
@@ -27,11 +28,22 @@ check "eDP PSR disabled on cmdline (amdgpu.dcdebugmask=0x10)" \
     "grep -q 'amdgpu.dcdebugmask=0x10' /proc/cmdline"
 check "resume= present on cmdline"        "grep -q 'resume=' /proc/cmdline"
 check "resume_offset present on cmdline"  "grep -q 'resume_offset=' /proc/cmdline"
-check "lid switch = hibernate" \
-    "grep -rqi 'HandleLidSwitch=hibernate' /etc/systemd/logind.conf.d/ 2>/dev/null"
-check "nvidia-teardown sleep hook installed" \
-    "test -x /usr/lib/systemd/system-sleep/80-nvidia-teardown.sh"
+check "lid switch = ignore (lid only blanks the panel; sleep is explicit)" \
+    "grep -rqiE '^HandleLidSwitch=ignore' /etc/systemd/logind.conf.d/*.conf 2>/dev/null"
+check "nvidia unloaded before sleep (g14-diag guard, or the older fail-open hook)" \
+    "systemctl is-enabled -q g14-nvidia-teardown.service || test -x /usr/lib/systemd/system-sleep/80-nvidia-teardown.sh"
+check "hibernate powers off via the kernel (/sys/power/disk = [shutdown])" \
+    "grep -q '\\[shutdown\\]' /sys/power/disk"
 check "swap active (for hibernate)" "test -n \"\$(swapon --noheadings 2>/dev/null)\""
+
+echo "== GPU routing + driver state (issues #11, #12) =="
+MUX="$(cat /sys/class/firmware-attributes/*/attributes/gpu_mux_mode/current_value 2>/dev/null | head -1)"
+check "MUX in hybrid mode (gpu_mux_mode=1; 0 = NVIDIA drives the panel)" "[ \"$MUX\" = 1 ]"
+LOADED="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' /proc/driver/nvidia/version 2>/dev/null | head -1)"
+DISK="$(modinfo -F version nvidia 2>/dev/null)"
+check "loaded NVIDIA driver matches installed (loaded ${LOADED:-none}, installed ${DISK:-none})" \
+    "[ -z \"$LOADED\" ] || [ \"$LOADED\" = \"$DISK\" ]"
+check "running kernel's modules still installed (else: reboot)" "test -d /usr/lib/modules/\$(uname -r)"
 
 echo "== Hibernation swapfile contiguity (issue #2 ⚠️) =="
 warn() { printf '  \033[33m?\033[0m %s\n' "$1"; }
@@ -60,5 +72,5 @@ echo "== Platform =="
 check "sleep mode is s2idle" "grep -q '\\[s2idle\\]' /sys/power/mem_sleep"
 
 echo
-echo "Tip: after a long lid-close, confirm hibernation actually fired with:"
-echo "  journalctl -b -1 | grep -E 'PM: hibernation|Reached target Hibernate'"
+echo "Tip: per-sleep teardown results:  grep nvidia-teardown /var/log/suspend-s0ix.log | tail"
+echo "     full health + who holds the dGPU:  g14-diag status   (diag/README.md)"

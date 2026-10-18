@@ -9,6 +9,16 @@
 > **hibernate on lid close** (powers fully off → no s0ix), plus a sleep hook that unloads
 > nvidia before any sleep.
 
+> **Updates.**
+> - **2026-06-16:** lid close was changed to *ignore* (niri blanks the panel; sleep is explicit),
+>   see [`10-lid-ignore.conf`](../configs/systemd/logind.conf.d/10-lid-ignore.conf). Hibernate is
+>   still the recommended way to sleep the lid for long periods; it needs README issue #10's
+>   `shutdown` mode.
+> - **2026-10-18:** the root cause here stands, but the fail-open teardown hook silently stopped
+>   working (`nvidia_mods=4/5`) because the MUX had moved to dGPU-direct and the compositor held
+>   NVIDIA (README #11), and once because of an un-rebooted driver upgrade (README #12). The hook
+>   is superseded by the fail-closed [g14-diag sleep guard](../diag/README.md).
+
 ## How it presents
 
 - **Short lid close → always fine.** Long / overnight close → machine wedged, force-power
@@ -60,9 +70,9 @@ convenient no-reboot GPU switcher for gaming — it just doesn't fix suspend.
 ## The fix
 
 **1. Lid close → hibernate (S4).** Powers fully off, so there is no s0ix and nothing pokes
-`PEGP`. Also zero battery drain while closed. See
-[`configs/systemd/logind.conf.d/10-lid-hibernate.conf`](../configs/systemd/logind.conf.d/10-lid-hibernate.conf)
-(`HandleLidSwitch=hibernate`, `HandleLidSwitchExternalPower=hibernate`,
+`PEGP`. Also zero battery drain while closed. The original config (now kept only as a commented rollback in
+[`configs/systemd/logind.conf.d/10-lid-ignore.conf`](../configs/systemd/logind.conf.d/10-lid-ignore.conf))
+was (`HandleLidSwitch=hibernate`, `HandleLidSwitchExternalPower=hibernate`,
 `HandleLidSwitchDocked` left unset = `ignore` so clamshell with an external monitor keeps
 running). Hibernate prereqs (contiguous swapfile, `resume_offset`, nvidia-out-of-initramfs)
 are issue #2 in the README.

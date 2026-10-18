@@ -5,7 +5,7 @@
 > reset path → black screen on resume. It is **not** suspend-specific (it also reproduces under
 > pure compute load on this exact silicon). **As of June 2026 there is no proven parameter cure.**
 > Do not chase `cwsr_enable=0`, `mes=0`, or `gpu_recovery=0`. The right posture is the one
-> already in place: hibernate-on-lid, a current kernel + MES firmware, and GPU recovery left on.
+> already in place: few sleep cycles (lid close no longer sleeps; originally hibernate-on-lid), a current kernel + MES firmware, and GPU recovery left on.
 
 ## Signature
 
