@@ -257,6 +257,38 @@ recovery left on, and updating the kernel to pick up the ongoing reset-path fixe
 screens, switch to a TTY (**Ctrl+Alt+F2**) rather than hitting power. **Full analysis + sources:**
 [`docs/amdgpu-mes-graphics-ring-wedge.md`](docs/amdgpu-mes-graphics-ring-wedge.md).
 
+### 10. Hibernate writes & resumes but never powers off — `platform` S4 bounce; use `shutdown` mode
+
+**Symptom:** `systemctl hibernate` snapshots and resumes fine but won't power the machine
+**off** — it bounces back on its own (often to the greeter), or stalls half-on needing a
+hard-off. The *next* cold boot then resumes from the on-disk image, which masks it as
+"working." Lived experience: *"hibernate kind of works, it just never shuts all the way
+down."* Image-write and resume were always fine — only the final power-off was broken.
+
+**Root cause:** the default `/sys/power/disk = platform` hands the power-off to **firmware**
+ACPI **S4**, and this board's firmware **bounces** (`Preparing to enter S4` → `Waking up from
+S4` in the same second) instead of cutting power. `shutdown` mode makes the **kernel** power
+off itself, bypassing the broken handoff. **Both** `shutdown` mode **and** the issue-#2
+nvidia-teardown hook are required — with the dGPU still bound, the power-off aborts even in
+`shutdown` mode (same `PEGP`/NVRM root as issue #2).
+
+> ⚠️ The kernel log is **deceptively identical** for a bounce and a real hibernate. `boot_id`
+> stays unchanged for **both** (a real resume restores the saved `boot_id`; a bounce never
+> left), and the `Image saving` lines never persist (emitted while journald is frozen). The
+> only reliable test is **physical**: did the machine go fully dark and need a power-button
+> press to return? See the doc for the full forensic trap.
+
+**Fix:** [`configs/tmpfiles.d/hibernate-shutdown-mode.conf`](configs/tmpfiles.d/hibernate-shutdown-mode.conf)
+(`w /sys/power/disk - - - - shutdown`) — the knob is runtime-only, so the `tmpfiles.d` `w`
+rule re-sets it every boot. Apply now: `sudo systemd-tmpfiles --create
+/etc/tmpfiles.d/hibernate-shutdown-mode.conf`. The teardown hook is already in place from
+issue #2.
+
+**Verify:** machine goes **fully dark** + needs a power-button press to resume (primary check —
+logs can't tell a bounce from success); session restores with `boot_id` unchanged; after a
+reboot `cat /sys/power/disk` still shows `[shutdown]`. **Full write-up:**
+[`docs/hibernate-s4-platform-bounce.md`](docs/hibernate-s4-platform-bounce.md).
+
 ---
 
 ## Repo layout
@@ -268,6 +300,7 @@ linux-asus-g14-ga403wr/
 │   ├── nvidia-suspend-path-b.md              # kernel-notifier path + sources (issue #1)
 │   ├── nvidia-pegp-dnotifier-s2idle-wedge.md # long-sleep wedge root cause + fix (issue #2)
 │   ├── amdgpu-mes-graphics-ring-wedge.md     # amdgpu iGPU MES wedge, no proven fix (issue #9)
+│   ├── hibernate-s4-platform-bounce.md       # hibernate won't power off; shutdown mode fix (issue #10)
 │   └── rog-boot-logo-efivar.md               # remove CachyOS splash + ROG animation (issue #8)
 ├── scripts/
 │   ├── disable-rog-boot-animation.sh  # toggle the ROG boot animation EFI var (issue #8)
@@ -278,6 +311,7 @@ linux-asus-g14-ga403wr/
     ├── modprobe.d/nvidia-drm.conf
     ├── initcpio/install/nvidia-noinitramfs  # keeps nvidia out of the initramfs (issue #1)
     ├── tmpfiles.d/pm-debug.conf             # persist pm_debug_messages=1 (issue #2 diag)
+    ├── tmpfiles.d/hibernate-shutdown-mode.conf  # force /sys/power/disk=shutdown each boot (issue #10)
     ├── default/limine.cmdline
     └── systemd/
         ├── logind.conf.d/10-lid-hibernate.conf   # lid close -> hibernate (issue #2)
