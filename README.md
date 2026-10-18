@@ -346,7 +346,9 @@ Optimus/Standard) or with `asusctl armoury set gpu_mux_mode 1`, then do a **full
 boot**. Hybrid alone wasn't enough. Two more things still held `/dev/nvidia0`:
 - **niri** picks card0 = NVIDIA even in hybrid, because the iGPU has no `boot_vga`. Even with
   `render-drm-device` pointing at the iGPU, it still opens NVIDIA as a secondary output GPU.
-  Both lines are needed in the `debug {}` block of `config.kdl`:
+  Both lines are needed in a `debug {}` block. They live in the per-machine
+  [`configs/niri/local.kdl`](configs/niri/local.kdl) (→ `~/.config/niri/local.kdl`, which
+  the shared niri config includes last), because the PCI paths are G14-specific:
   ```kdl
   render-drm-device "/dev/dri/by-path/pci-0000:65:00.0-render"   // AMD iGPU
   ignore-drm-device "/dev/dri/by-path/pci-0000:64:00.0-render"   // NVIDIA: costs dGPU-wired outputs (HDMI)

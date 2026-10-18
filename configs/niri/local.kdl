@@ -1,0 +1,14 @@
+// Per-machine niri settings for cachyos-g14 (ASUS ROG Zephyrus G14 GA403WR, hybrid MUX).
+// Included last from config.kdl; not tracked in niri-config. Snapshot kept in
+// ~/github/linux-asus-g14-ga403wr/configs/niri/local.kdl.
+
+debug {
+    // Render on the AMD iGPU. Without this niri picks card0 = NVIDIA (the iGPU has no
+    // boot_vga), which pins nvidia_drm so the sleep guard can never unload it.
+    // By-path = stable across boots.
+    render-drm-device "/dev/dri/by-path/pci-0000:65:00.0-render"
+    // render-drm-device alone isn't enough: niri still opens the NVIDIA card as a secondary
+    // (output) GPU and holds /dev/nvidia0. Ignore it entirely. Cost: any output wired to the
+    // dGPU (likely HDMI) won't light up under niri.
+    ignore-drm-device "/dev/dri/by-path/pci-0000:64:00.0-render"
+}
