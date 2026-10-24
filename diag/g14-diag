@@ -362,12 +362,16 @@ watch_() {
   declare -A last
   local line key now dir
   journalctl -k -f -n0 -q -o short-iso --grep "$ALARM_RE" 2>/dev/null | while IFS= read -r line; do
+    # "traps: app[pid] general protection fault ip:..." is the kernel reporting a userspace
+    # crash (coredumpctl has it), not a kernel GPF ("general protection fault, probably for...").
+    [[ $line == *"traps: "*"] general protection fault ip:"* ]] && continue
     key=$(grep -oE 'Xid \(PCI:[^)]*\): [0-9]+|uvm encountered|fallen off the bus|ring .* timeout|GPU reset|blocked for more|lockup|BUG|Oops|protection fault|Machine check|Out of memory' <<<"$line" | head -1 | sed -E 's/\(PCI:[^)]*\): /#/')
     key=${key:-alarm}
     now=$(date +%s)
     [ $(( now - ${last[$key]:-0} )) -lt 300 ] && continue
     last[$key]=$now
-    dir="$DIAG_DIR/live/$(date '+%Y%m%d-%H%M%S')_${key//[^A-Za-z0-9#]/_}"
+    # Hyphens, not underscores: the notification popup renders _x_ as italics.
+    dir="$DIAG_DIR/live/$(date '+%Y%m%d-%H%M%S')-${key//[^A-Za-z0-9#]/-}"
     if mkdir -p "$dir" 2>/dev/null; then
       echo "$line" > "$dir/trigger.txt"
       state > "$dir/state.txt" 2>&1
