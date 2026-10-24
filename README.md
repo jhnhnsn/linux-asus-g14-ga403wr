@@ -12,7 +12,7 @@ every entry is something that actually broke on this machine and the fix that re
 | | |
 |---|---|
 | **Lid close** | does **not** sleep — logind ignores it, niri just blanks the panel ([`10-lid-ignore.conf`](configs/systemd/logind.conf.d/10-lid-ignore.conf)) |
-| **Suspend / hibernate** | explicit only (power key / menu). Hibernate works with `shutdown` mode (#10) |
+| **Suspend / hibernate** | explicit only (power key / menu). Hibernate works once nvidia is unloaded; mode pinned to `shutdown` via `sleep.conf.d` (#10) |
 | **dGPU during sleep** | must be driverless. The old fail-open hook silently failed twice (#11), so it's being replaced by the fail-closed [g14-diag sleep guard](diag/README.md) |
 | **⚠️ MUX** | found in **dGPU-direct** (`gpu_mux_mode=0`): NVIDIA drives the panel, so nothing can unload it (#11). **Switching back to hybrid is the pending fix** |
 | **After every kernel/NVIDIA upgrade** | **reboot before sleeping** (#12) |
@@ -287,37 +287,41 @@ recovery left on, and updating the kernel to pick up the ongoing reset-path fixe
 screens, switch to a TTY (**Ctrl+Alt+F2**) rather than hitting power. **Full analysis + sources:**
 [`docs/amdgpu-mes-graphics-ring-wedge.md`](docs/amdgpu-mes-graphics-ring-wedge.md).
 
-### 10. Hibernate writes & resumes but never powers off — `platform` S4 bounce; use `shutdown` mode
+### 10. Hibernate "never powered off" — it was nvidia, not the firmware; pin the mode in `sleep.conf.d`
 
-**Symptom:** `systemctl hibernate` snapshots and resumes fine but won't power the machine
-**off** — it bounces back on its own (often to the greeter), or stalls half-on needing a
-hard-off. The *next* cold boot then resumes from the on-disk image, which masks it as
-"working." Lived experience: *"hibernate kind of works, it just never shuts all the way
-down."* Image-write and resume were always fine — only the final power-off was broken.
+**Symptom (June 2026):** `systemctl hibernate` wrote its image, then either stayed half-on
+needing a hard-off or came straight back on. The next cold boot resumed from the on-disk image,
+which made it look like it had worked.
 
-**Root cause:** the default `/sys/power/disk = platform` hands the power-off to **firmware**
-ACPI **S4**, and this board's firmware **bounces** (`Preparing to enter S4` → `Waking up from
-S4` in the same second) instead of cutting power. `shutdown` mode makes the **kernel** power
-off itself, bypassing the broken handoff. **Both** `shutdown` mode **and** the issue-#2
-nvidia-teardown hook are required — with the dGPU still bound, the power-off aborts even in
-`shutdown` mode (same `PEGP`/NVRM root as issue #2).
+**Root cause:** the dGPU still being bound to nvidia during the transition (the issue-#2 root).
+With the nvidia stack unloaded first (the [g14-diag sleep guard](diag/README.md)), hibernate
+powers off and restores. Verified 2026-10-21 in `platform` mode: `Hibernation image restored
+successfully` after 55.9 s with the clock paused.
 
-> ⚠️ The kernel log is **deceptively identical** for a bounce and a real hibernate. `boot_id`
-> stays unchanged for **both** (a real resume restores the saved `boot_id`; a bounce never
-> left), and the `Image saving` lines never persist (emitted while journald is frozen). The
-> only reliable test is **physical**: did the machine go fully dark and need a power-button
-> press to return? See the doc for the full forensic trap.
+> **Correction (2026-10-22).** This section used to blame the firmware's ACPI S4 handoff and
+> "fix" it by writing `shutdown` to `/sys/power/disk` from `tmpfiles.d`. Both were wrong:
+> - **systemd-sleep overwrites `/sys/power/disk` on every hibernate** with `HibernateMode=`
+>   (default `platform shutdown`). The tmpfiles rule never took effect, so every hibernate here,
+>   including June's successful one, ran in `platform` mode.
+> - **`Preparing to enter S4` → `Waking up from S4` in the same second is normal.** In platform
+>   mode the kernel prints both around the memory snapshot, *before* the image is written. It
+>   was never evidence of a bounce.
 
-**Fix:** [`configs/tmpfiles.d/hibernate-shutdown-mode.conf`](configs/tmpfiles.d/hibernate-shutdown-mode.conf)
-(`w /sys/power/disk - - - - shutdown`) — the knob is runtime-only, so the `tmpfiles.d` `w`
-rule re-sets it every boot. Apply now: `sudo systemd-tmpfiles --create
-/etc/tmpfiles.d/hibernate-shutdown-mode.conf`. The teardown hook is already in place from
-issue #2.
+**How to tell from the log (no eyewitness needed):** run `g14-diag hibernations`. A real
+power-off loses the image-writing lines (they're printed after the snapshot) and the restored
+kernel logs `image restored successfully` plus `Timekeeping suspended for N seconds`. A machine
+that never powered off keeps its `Wrote N kbytes` line and exits without a restore.
 
-**Verify:** machine goes **fully dark** + needs a power-button press to resume (primary check —
-logs can't tell a bounce from success); session restores with `boot_id` unchanged; after a
-reboot `cat /sys/power/disk` still shows `[shutdown]`. **Full write-up:**
-[`docs/hibernate-s4-platform-bounce.md`](docs/hibernate-s4-platform-bounce.md).
+**Config:** [`configs/systemd/sleep.conf.d/50-hibernate-shutdown.conf`](configs/systemd/sleep.conf.d/50-hibernate-shutdown.conf)
+sets `HibernateMode=shutdown`, the only place the setting persists. `shutdown` powers off
+through the kernel (S5, the same path as `poweroff`). Platform S4 also works, but it arms the
+ACPI wake devices in `/proc/acpi/wakeup` (USB4 bridge, PCIe root ports), so a stray event can
+power the laptop on in a bag. The g14-diag guard also refuses to hibernate after a kernel
+upgrade without a reboot: the next boot would run the new kernel, which rejects the old image,
+and the session would be lost.
+
+**Verify:** `g14-diag hibernations` shows `mode=shutdown  RESTORED from disk`. Background and the
+June investigation: [`docs/hibernate-s4-platform-bounce.md`](docs/hibernate-s4-platform-bounce.md).
 
 ### 11. MUX found in dGPU-direct mode — NVIDIA drives the panel, so it can never be unloaded
 
@@ -419,14 +423,14 @@ linux-asus-g14-ga403wr/
 │   ├── nvidia-suspend-path-b.md              # kernel-notifier path + sources (issue #1)
 │   ├── nvidia-pegp-dnotifier-s2idle-wedge.md # long-sleep wedge root cause + fix (issue #2)
 │   ├── amdgpu-mes-graphics-ring-wedge.md     # amdgpu iGPU MES wedge, no proven fix (issue #9)
-│   ├── hibernate-s4-platform-bounce.md       # hibernate won't power off; shutdown mode fix (issue #10)
+│   ├── hibernate-s4-platform-bounce.md       # June hibernate investigation; see the correction in issue #10
 │   └── rog-boot-logo-efivar.md               # remove CachyOS splash + ROG animation (issue #8)
 ├── scripts/
 │   ├── disable-rog-boot-animation.sh  # toggle the ROG boot animation EFI var (issue #8)
 │   ├── dms-restart.sh       # bring back the DMS bar/launcher after a restart (issue #5)
 │   └── verify-suspend.sh    # check the suspend/hibernate config is intact (issues #1, #2, #10–#12)
 ├── diag/                    # g14-diag: per-boot incident bundles, sleep guard, live alerts (diag/README.md)
-│   ├── g14-diag             # the CLI (status / pending / note / ack / collect / guard / watch)
+│   ├── g14-diag             # the CLI (status / pending / hibernations / note / ack / collect / guard / watch)
 │   ├── install.sh           # sudo diag/install.sh [--without-guard | --uninstall]
 │   ├── systemd/             # collect-at-boot, fail-closed nvidia teardown/reload, user watcher
 │   ├── etc/                 # systemd/journald.conf.d retention/sync + sysctl crash-capture drop-ins
@@ -436,10 +440,10 @@ linux-asus-g14-ga403wr/
     ├── modprobe.d/nvidia-drm.conf
     ├── initcpio/install/nvidia-noinitramfs  # keeps nvidia out of the initramfs (issue #1)
     ├── tmpfiles.d/pm-debug.conf             # persist pm_debug_messages=1 (issue #2 diag)
-    ├── tmpfiles.d/hibernate-shutdown-mode.conf  # force /sys/power/disk=shutdown each boot (issue #10)
     ├── default/limine.cmdline
     └── systemd/
         ├── logind.conf.d/10-lid-ignore.conf      # lid close -> no sleep, niri blanks the panel (issue #2)
+        ├── sleep.conf.d/50-hibernate-shutdown.conf  # HibernateMode=shutdown, read by systemd-sleep (issue #10)
         ├── system/systemd-suspend.service.d/20-freeze-user-sessions.conf  # re-freeze sessions (issue #2)
         └── system-sleep/
             ├── 80-nvidia-teardown.sh      # fail-open predecessor of the g14-diag sleep guard (issue #2)

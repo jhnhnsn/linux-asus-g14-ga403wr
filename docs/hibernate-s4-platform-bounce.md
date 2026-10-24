@@ -1,3 +1,11 @@
+> **⚠️ Superseded (2026-10-22): the conclusions below are wrong. Kept for the record.**
+> systemd-sleep writes `HibernateMode=` (default `platform shutdown`) to `/sys/power/disk` on
+> every hibernate, so the tmpfiles.d rule described here never took effect: June's working
+> hibernate ran in `platform` mode. And `Preparing to enter S4` / `Waking up from S4` in the same
+> second is printed around the snapshot by every platform-mode hibernate, so it never showed a
+> bounce. The real fix was unloading nvidia first. Current state and how to read the log: README
+> issue #10 and `g14-diag hibernations`.
+
 # Hibernate never powers off — the `platform` S4 bounce, fixed with `/sys/power/disk=shutdown`
 
 > **TL;DR** Hibernate on the GA403WR wrote its image and resumed fine, but it would **not

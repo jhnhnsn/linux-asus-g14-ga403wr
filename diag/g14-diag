@@ -93,6 +93,33 @@ nv_holders() {
   done
 }
 
+# One line per hibernate in boot $1 (default: this one) with how it ended. The kernel prints
+# "Preparing to enter ... S4" and "Waking up from ... S4" around the snapshot in EVERY
+# platform-mode hibernate, so those never meant a bounce. What survives in the log does:
+# a real power-off loses the image-writing lines and the restored kernel logs "image restored";
+# a machine that never powered off keeps its "Wrote N kbytes" line and exits without a restore.
+hibernations() {
+  journalctl -k -b "${1:-0}" -q --no-pager -o short-iso \
+    -g 'hibernation (entry|exit)|Creating image|image restored|Preparing to enter system sleep state S4|Timekeeping suspended|rolling back|Wrote [0-9]+ kbytes' 2>/dev/null |
+  awk '
+    function out(r) {
+      if (r == "") r = res == "restored" ? "RESTORED from disk" (off != "" ? " (clock paused " off " s)" : "") \
+                     : res != "" ? res : wrote ? "DID NOT POWER OFF (image written, then it kept running)" : "ABORTED before the image was written"
+      print t "  mode=" mode "  " r
+      t = ""
+    }
+    /hibernation entry/ { if (t) out("no exit logged"); t = $1; mode = "?"; res = ""; off = ""; wrote = 0; next }
+    !t { next }
+    /Preparing to enter system sleep state S4/ { mode = "platform" }
+    /Creating image/ && mode == "?" { mode = "shutdown" }
+    /Wrote [0-9]+ kbytes/ { wrote = 1 }
+    /Timekeeping suspended for/ { for (i = 1; i <= NF; i++) if ($i == "for") off = $(i+1) }
+    /image restored successfully/ { res = "restored" }
+    /rolling back/ { res = "ROLLED BACK by a wakeup event (never powered off)" }
+    /hibernation exit/ { out("") }
+    END { if (t) out("NEVER RESTORED (powered off and the session was lost, or it died mid-hibernate)") }'
+}
+
 state() {
   local pci mux kver loaded disk c drv
   kver=$(uname -r)
@@ -117,7 +144,9 @@ state() {
   pci=$(nv_pci)
   [ -n "$pci" ] && echo "dGPU power       : $(cat /sys/bus/pci/devices/"$pci"/power/runtime_status 2>/dev/null) ($pci)"
   echo "nvidia modules   : $(lsmod | awk '/^nvidia/{printf "%s(%s) ", $1, $3}')"
-  echo "sleep            : mem_sleep=$(cat /sys/power/mem_sleep 2>/dev/null)  disk=$(cat /sys/power/disk 2>/dev/null)"
+  echo "sleep            : mem_sleep=$(cat /sys/power/mem_sleep 2>/dev/null)  disk=$(cat /sys/power/disk 2>/dev/null)  HibernateMode=$(systemd-analyze cat-config systemd/sleep.conf 2>/dev/null | grep -E '^HibernateMode=' | tail -1 | cut -d= -f2)"
+  local lh; lh=$(hibernations | tail -1)
+  echo "last hibernate   : ${lh:-none this boot}"
   local jc; jc=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null)
   echo "journald         : SystemMaxUse=$(grep -E '^SystemMaxUse=' <<<"$jc" | tail -1 | cut -d= -f2) SyncIntervalSec=$(grep -E '^SyncIntervalSec=' <<<"$jc" | tail -1 | cut -d= -f2) (effective; last drop-in wins)"
   echo "pstore archiving : $(systemctl is-enabled systemd-pstore.service 2>/dev/null || true)"
@@ -156,10 +185,14 @@ collect() {
   else
     verdict="HARD RESET or power loss (journal ends with no shutdown sequence)"; bad=1
   fi
-  sleepline=$($J -k -g 'PM: suspend (entry|exit)|PM: hibernation: (entry|exit)' | tail -1)
+  # The kernel prints "PM: hibernation: hibernation entry". The systemd-{suspend,hibernate}
+  # unit start also counts: a boot can die after it but before anything else reaches disk (2026-10-20).
+  sleepline=$($J -g 'PM: suspend (entry|exit)|PM: hibernation: hibernation (entry|exit)|Starting System (Suspend|Hibernate)|returned from sleep operation' | tail -1)
   case "$sleepline" in
-    *"suspend entry"*|*"hibernation: entry"*) [ $bad = 1 ] && verdict="$verdict — died DURING sleep/resume";;
-    *exit*)
+    *"hibernation entry"*|*"Starting System Hibernate"*)
+      [ $bad = 1 ] && verdict="$verdict — ended inside a hibernate (powered off and never restored, or died while hibernating)";;
+    *"suspend entry"*|*"Starting System Suspend"*) [ $bad = 1 ] && verdict="$verdict — died DURING sleep/resume";;
+    *exit*|*"returned from sleep"*)
       local sx; sx=$(date -d "$(cut -d' ' -f1 <<<"$sleepline")" +%s 2>/dev/null)
       [ $bad = 1 ] && [ -n "$sx" ] && [ $(( ${last%.*} - sx )) -lt 600 ] && \
         verdict="$verdict — $(( ${last%.*} - sx ))s after resuming from sleep";;
@@ -169,8 +202,9 @@ collect() {
   $J -n "$TAIL_LINES" | grep -vE "$NOISE_FILTER" > "$dir/tail.log"
   $J -k -g "$ALARM_RE|NVRM|amdgpu.*(error|fail|timeout)|Failed to allocate NVKMS|API mismatch|Direct firmware load .* failed" \
     | head -n 3000 > "$dir/kernel-errors.log"
-  $J -g 'PM: suspend (entry|exit)|Timekeeping suspended|suspend requested|Lid (opened|closed)|Power key pressed|Performing sleep|returned from sleep|hibernation: (entry|exit)|Dependency failed|g14-diag' \
+  $J -g 'PM: suspend (entry|exit)|Timekeeping suspended|suspend requested|hibernate requested|Lid (opened|closed)|Power key pressed|Performing sleep|returned from sleep|hibernation (entry|exit)|image restored|Dependency failed|g14-diag' \
     > "$dir/sleep.log"
+  hibernations "$boot" > "$dir/hibernate.log"
   awk -v a="$first_t" -v b="$last_t" '{t=substr($0,1,19)} t>=a && t<=b' "$SLEEP_LOG" 2>/dev/null \
     | grep -E 'nvidia-teardown|g14-diag|refus' > "$dir/nvidia-teardown.log"
   awk -v a="${first_t/ /T}" -v b="${last_t/ /T}" '{t=substr($0,2,19)} t>=a && t<=b' /var/log/pacman.log 2>/dev/null \
@@ -200,7 +234,8 @@ collect() {
     echo "VERDICT   : $verdict"
     local kv; kv=$($J -k -g 'Linux version' | head -1 | grep -oE 'Linux version [^ ]+' | cut -d' ' -f3)
     echo "kernel    : ${kv:-?}   nvidia loaded at boot: ${nvver:-?}$([ -z "$kv" ] && echo '   (start of this boot already rotated out of the journal)')"
-    echo "sleep     : $(grep -c 'suspend entry' "$dir/sleep.log") suspend(s), $(grep -c 'hibernation: entry' "$dir/sleep.log") hibernate(s); last: ${sleepline:-none}"
+    echo "sleep     : $(grep -c 'suspend entry' "$dir/sleep.log") suspend(s), $(grep -c 'hibernation entry' "$dir/sleep.log") hibernate(s); last: ${sleepline:-none}"
+    [ -s "$dir/hibernate.log" ] && echo "hibernate : $(awk '{sub(/ \(.*/, ""); $1 = ""; print}' "$dir/hibernate.log" | sed 's/^ *//' | sort | uniq -c | awk '{n=$1; $1=""; printf "%s ×%s; ", substr($0,2), n}')"
     echo "teardown  : $(grep -oE '(pre|post) +\([a-z-]+\): nvidia_mods=[0-9]+' "$dir/nvidia-teardown.log" | awk '{print $1, $NF}' | sort | uniq -c | awk '{printf "%s %s ×%s; ", $2, $3, $1}')(healthy: pre nvidia_mods=0)"
     grep -q REFUSED "$dir/nvidia-teardown.log" && echo "guard     : $(grep -c REFUSED "$dir/nvidia-teardown.log") sleep(s) refused — $(grep REFUSED "$dir/nvidia-teardown.log" | tail -1 | cut -c21-)"
     echo "GPU faults: ${xids:-none}$([ -n "$fatal" ] && echo " — FATAL Xid:$fatal")"
@@ -265,7 +300,18 @@ reload_nvidia() {
 guard_pre() {
   need_root guard
   mkdir -p "$RUN_DIR"; rm -f "$RUN_DIR/unloaded"
-  if ! lsmod | grep -q '^nvidia '; then log "nvidia-teardown pre (sleep): nvidia_mods=0 (not loaded)"; return 0; fi
+  # One guard serves every sleep type; the queued job says which one this is.
+  local op=sleep kver
+  systemctl list-jobs --no-legend 2>/dev/null | grep -qE 'systemd-(hibernate|hybrid-sleep|suspend-then-hibernate)\.service' && op=hibernate
+  kver=$(uname -r)
+  # After a kernel upgrade the next boot runs the NEW kernel, which rejects an image written by
+  # this one: the session is lost. Refused even in warn mode, since that outcome is certain.
+  if [ "$op" = hibernate ] && [ ! -d "/usr/lib/modules/$kver" ]; then
+    log "REFUSED hibernate: kernel $kver was replaced by an upgrade (suspend still allowed)"
+    notify "Hibernate refused" "Kernel $kver was upgraded, so the next boot could not restore this session. Reboot first (suspend still works)."
+    return 1
+  fi
+  if ! lsmod | grep -q '^nvidia '; then log "nvidia-teardown pre ($op): nvidia_mods=0 (not loaded)"; return 0; fi
   local loaded disk n holders why=""
   loaded=$(nv_loaded_version); disk=$(nv_disk_version)
   [ "$loaded" != "$disk" ] && why="NVIDIA $loaded is loaded but ${disk:-no module} is installed — reboot first"
@@ -275,8 +321,8 @@ guard_pre() {
     systemctl stop cardwired.service nvidia-powerd.service 2>/dev/null
     for m in $NV_MODULES; do modprobe -r "$m" 2>/dev/null; done
     n=$(lsmod | grep -c '^nvidia')
-    log "nvidia-teardown pre (sleep): nvidia_mods=$n"
-    [ "$n" -eq 0 ] && { touch "$RUN_DIR/unloaded"; return 0; }
+    log "nvidia-teardown pre ($op): nvidia_mods=$n"
+    [ "$n" -eq 0 ] && { echo "$op" > "$RUN_DIR/unloaded"; return 0; }
     holders=$(nv_holders | cut -d: -f1 | sort -u | tr '\n' ' ')
     why="NVIDIA is still in use by: ${holders:-unknown} — close it (or check gpu_mux_mode)"
     reload_nvidia
@@ -293,9 +339,9 @@ guard_pre() {
 guard_post() {
   need_root guard
   [ -e "$RUN_DIR/unloaded" ] || return 0
-  rm -f "$RUN_DIR/unloaded"
+  local op; op=$(cat "$RUN_DIR/unloaded" 2>/dev/null); rm -f "$RUN_DIR/unloaded"
   reload_nvidia
-  log "nvidia-teardown post (sleep): nvidia_mods=$(lsmod | grep -c '^nvidia')"
+  log "nvidia-teardown post (${op:-sleep}): nvidia_mods=$(lsmod | grep -c '^nvidia')"
 }
 
 # ---------------------------------------------------------------- pacman hook
@@ -340,6 +386,7 @@ usage: g14-diag <command>
   status            current health: driver versions, MUX mode, who holds the dGPU, guard state
   pending [--claude] summaries of bad boots not yet reviewed (silent if none)
   latest            summary of the most recent bundle
+  hibernations [boot]  how each hibernate in a boot ended (default: this boot)
   note "text"       add what you saw to the latest bundle (e.g. "black screen after lid open")
   ack [name|all]    mark bundle(s) reviewed
   collect [idx] [--force]   (root) build the bundle for boot idx (default -1)
@@ -356,6 +403,7 @@ case "$cmd" in
   pending)      pending "${1:-}" ;;
   latest)       cat "$DIAG_DIR/latest/summary.txt" 2>/dev/null || die "no bundle yet"
                 [ -s "$DIAG_DIR/latest/notes.txt" ] && { echo "user notes:"; cat "$DIAG_DIR/latest/notes.txt"; } ;;
+  hibernations) hibernations "${1:-0}" ;;
   note)         note "$@" ;;
   ack)          ack "${1:-all}" ;;
   collect)      collect "${1:--1}" "${2:-}" ;;

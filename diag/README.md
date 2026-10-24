@@ -15,7 +15,7 @@ share a log in an issue, quote only the lines you need.
 | Don't lose evidence | `etc/systemd/journald.conf.d/50-g14-diag.conf` | journal keeps 1 GB (months) and syncs every 15 s instead of every 5 min. Overrides CachyOS's default `SystemMaxUse=50M` |
 | | `systemd-pstore.service` enabled | kernel panic records saved to `/var/lib/systemd/pstore` |
 | | `etc/sysctl.d/50-g14-diag.conf` | soft lockups panic (so they leave a crash record); full Magic SysRq |
-| Prevent known wedges | `g14-nvidia-teardown.service` / `-reload.service` | **fail-closed** replacement for `80-nvidia-teardown.sh`: unloads NVIDIA before sleep and **refuses the sleep** if it can't, or if the loaded driver no longer matches the installed one |
+| Prevent known wedges | `g14-nvidia-teardown.service` / `-reload.service` | **fail-closed** replacement for `80-nvidia-teardown.sh`: unloads NVIDIA before sleep and **refuses the sleep** if it can't, or if the loaded driver no longer matches the installed one. Also refuses a **hibernate** after a kernel upgrade without a reboot (the new kernel can't restore the old image) |
 | | `pacman/95-g14-diag-reboot-check.hook` | after a kernel/NVIDIA upgrade: terminal + desktop warning to reboot before sleeping |
 | Per-boot bundle | `g14-diag-collect.service` | at every boot, writes `/var/log/g14-diag/<date>_boot-<id>/` describing how the previous boot ended |
 | Live alarm | `g14-diag-watch.service` (user) | desktop notification + state snapshot the moment an Xid / GPU timeout / hung task is logged |
@@ -27,6 +27,7 @@ summary.txt            verdict + the counts that matter — read this first
 tail.log               last 300 journal lines (firewall spam filtered)
 kernel-errors.log      every NVRM/Xid/amdgpu/lockup/BUG line from that boot
 sleep.log              lid, power key, suspend/resume/hibernate events
+hibernate.log          how each hibernate ended: restored from disk / never powered off / never restored
 nvidia-teardown.log    nvidia_mods= results per sleep (pre should be 0) and refused sleeps
 packages.log           packages changed during that boot (= running without a reboot)
 coredumps.txt          crashed processes
@@ -73,6 +74,7 @@ Settings live in `/etc/g14-diag.conf`: bundle dir, the group allowed to read bun
 g14-diag status                 # versions, MUX mode, panel GPU, dGPU power, who holds NVIDIA
 g14-diag latest                 # summary of the newest bundle
 g14-diag pending                # bad boots not yet reviewed
+g14-diag hibernations [boot]    # how each hibernate ended, read from the kernel log
 g14-diag note "black screen after lid open, caps lock still toggled"
 g14-diag ack all                # mark reviewed
 ```

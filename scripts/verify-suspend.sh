@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # verify-suspend.sh — sanity-check the s2idle / hibernate config on the G14.
 # Covers README issues #1 (short-cycle resume), #2 (dGPU out of the sleep path),
-# #10 (hibernate shutdown mode), #11 (MUX mode) and #12 (reboot after upgrades),
+# #10 (hibernate mode pinned in sleep.conf.d), #11 (MUX mode) and #12 (reboot after upgrades),
 # including the btrfs swapfile single-extent + matching-offset checks.
 # Read-only: makes no changes. Run as your normal user (a couple of checks use
 # `sudo -n` to read the 0600 swapfile; they degrade to a '?' hint without sudo).
@@ -32,8 +32,8 @@ check "lid switch = ignore (lid only blanks the panel; sleep is explicit)" \
     "grep -rqiE '^HandleLidSwitch=ignore' /etc/systemd/logind.conf.d/*.conf 2>/dev/null"
 check "nvidia unloaded before sleep (g14-diag guard, or the older fail-open hook)" \
     "systemctl is-enabled -q g14-nvidia-teardown.service || test -x /usr/lib/systemd/system-sleep/80-nvidia-teardown.sh"
-check "hibernate powers off via the kernel (/sys/power/disk = [shutdown])" \
-    "grep -q '\\[shutdown\\]' /sys/power/disk"
+check "hibernate powers off via the kernel (HibernateMode=shutdown; systemd-sleep rewrites /sys/power/disk each time)" \
+    "systemd-analyze cat-config systemd/sleep.conf 2>/dev/null | grep -E '^HibernateMode=' | tail -1 | grep -qx 'HibernateMode=shutdown'"
 check "swap active (for hibernate)" "test -n \"\$(swapon --noheadings 2>/dev/null)\""
 
 echo "== GPU routing + driver state (issues #11, #12) =="
