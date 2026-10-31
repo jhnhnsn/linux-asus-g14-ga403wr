@@ -190,7 +190,14 @@ collect() {
   sleepline=$($J -g 'PM: suspend (entry|exit)|PM: hibernation: hibernation (entry|exit)|Starting System (Suspend|Hibernate)|returned from sleep operation' | tail -1)
   case "$sleepline" in
     *"hibernation entry"*|*"Starting System Hibernate"*)
-      [ $bad = 1 ] && verdict="$verdict — ended inside a hibernate (powered off and never restored, or died while hibernating)";;
+      # A restored session resumes right after "Creating image", so a crash before journald
+      # catches up shows only in pstore: timekeeping restarting after it means it was restored.
+      if [ $bad = 1 ] && find /var/lib/systemd/pstore -name dmesg.txt -newer "$DIAG_DIR/.pstore-stamp" -exec cat {} + 2>/dev/null \
+           | awk '/hibernation: Creating image/{c=1} c && /Timekeeping suspended/{r=1} END{exit !r}'; then
+        verdict="$verdict — restored from hibernate, then crashed (see pstore)"
+      elif [ $bad = 1 ]; then
+        verdict="$verdict — ended inside a hibernate (powered off and never restored, or died while hibernating)"
+      fi;;
     *"suspend entry"*|*"Starting System Suspend"*) [ $bad = 1 ] && verdict="$verdict — died DURING sleep/resume";;
     *exit*|*"returned from sleep"*)
       local sx; sx=$(date -d "$(cut -d' ' -f1 <<<"$sleepline")" +%s 2>/dev/null)
@@ -299,10 +306,21 @@ reload_nvidia() {
 }
 guard_pre() {
   need_root guard
-  mkdir -p "$RUN_DIR"; rm -f "$RUN_DIR/unloaded"
+  mkdir -p "$RUN_DIR"; rm -f "$RUN_DIR/unloaded" "$RUN_DIR/wifi-unloaded"
   # One guard serves every sleep type; the queued job says which one this is.
-  local op=sleep kver
+  local op=sleep
   systemctl list-jobs --no-legend 2>/dev/null | grep -qE 'systemd-(hibernate|hybrid-sleep|suspend-then-hibernate)\.service' && op=hibernate
+  guard_nvidia "$op" || return 1
+  # mt7925e's reset work oopsed on restore from hibernate (NULL deref in napi_disable,
+  # 2026-10-31) and froze the session. Suspend has been fine, so only hibernate unloads it.
+  if [ "$op" = hibernate ] && lsmod | grep -q '^mt7925e '; then
+    modprobe -r mt7925e 2>/dev/null && touch "$RUN_DIR/wifi-unloaded"
+    log "wifi teardown pre (hibernate): mt7925e $(lsmod | grep -q '^mt7925e ' && echo STILL LOADED || echo unloaded)"
+  fi
+  return 0
+}
+guard_nvidia() {
+  local op=$1 kver
   kver=$(uname -r)
   # After a kernel upgrade the next boot runs the NEW kernel, which rejects an image written by
   # this one: the session is lost. Refused even in warn mode, since that outcome is certain.
@@ -338,6 +356,10 @@ guard_pre() {
 }
 guard_post() {
   need_root guard
+  if [ -e "$RUN_DIR/wifi-unloaded" ]; then
+    rm -f "$RUN_DIR/wifi-unloaded"; modprobe mt7925e
+    log "wifi teardown post: mt7925e $(lsmod | grep -q '^mt7925e ' && echo reloaded || echo NOT LOADED)"
+  fi
   [ -e "$RUN_DIR/unloaded" ] || return 0
   local op; op=$(cat "$RUN_DIR/unloaded" 2>/dev/null); rm -f "$RUN_DIR/unloaded"
   reload_nvidia
