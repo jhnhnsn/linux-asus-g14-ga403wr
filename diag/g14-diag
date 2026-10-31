@@ -28,7 +28,7 @@ SLEEP_LOG=/var/log/suspend-s0ix.log
 RUN_DIR=/run/g14-diag
 NV_MODULES="nvidia_drm nvidia_uvm nvidia_modeset nvidia_wmi_ec_backlight nvidia"
 # Kernel lines worth an alarm. Xid alone is noisy-but-real on this machine (see README #11/#12).
-ALARM_RE='NVRM: Xid|uvm encountered global fatal error|GPU has fallen off the bus|RmInitAdapter failed|amdgpu.*ring .* timeout|amdgpu.*GPU reset begin|MES failed to respond|blocked for more than|soft lockup|hard LOCKUP|BUG:|Oops|general protection fault|Machine check|Out of memory: Killed'
+ALARM_RE='NVRM: Xid|uvm encountered global fatal error|GPU has fallen off the bus|RmInitAdapter failed|amdgpu.*ring .* timeout|amdgpu.*GPU reset begin|MES failed to respond|blocked for more than|soft lockup|hard LOCKUP|BUG:|Oops|general protection fault|Machine check|Out of memory: Killed|rcu: INFO: rcu_[a-z]+ detected (expedited )?stalls'
 # Xids that mean "this GPU is wedged until reboot" rather than "one app misbehaved".
 FATAL_XIDS=' 31 43 48 61 62 63 64 74 79 94 95 109 119 120 143 154 '
 
@@ -365,8 +365,12 @@ watch_() {
     # "traps: app[pid] general protection fault ip:..." is the kernel reporting a userspace
     # crash (coredumpctl has it), not a kernel GPF ("general protection fault, probably for...").
     [[ $line == *"traps: "*"] general protection fault ip:"* ]] && continue
-    key=$(grep -oE 'Xid \(PCI:[^)]*\): [0-9]+|uvm encountered|fallen off the bus|ring .* timeout|GPU reset|blocked for more|lockup|BUG|Oops|protection fault|Machine check|Out of memory' <<<"$line" | head -1 | sed -E 's/\(PCI:[^)]*\): /#/')
+    key=$(grep -oE 'Xid \(PCI:[^)]*\): [0-9]+|uvm encountered|fallen off the bus|ring .* timeout|GPU reset|blocked for more|lockup|BUG|Oops|protection fault|Machine check|Out of memory|detected (expedited )?stalls' <<<"$line" | head -1 | sed -E 's/\(PCI:[^)]*\): /#/')
     key=${key:-alarm}
+    # An RCU stall frees no RCU-deferred memory until it clears, so the slab grows to OOM
+    # hours later (2026-10-30: cardwire's eBPF inode_permission hook spun for 5 h).
+    local advice="Consider rebooting before you suspend."
+    [[ $key == *stalls ]] && { key="RCU stall"; advice="Kernel memory stops being freed: save your work and reboot."; }
     now=$(date +%s)
     [ $(( now - ${last[$key]:-0} )) -lt 300 ] && continue
     last[$key]=$now
@@ -380,7 +384,7 @@ watch_() {
       [ -n "$np" ] && { echo "niri pid $np state: $(awk '/^State/{print $2,$3}' /proc/"$np"/status) wchan: $(cat /proc/"$np"/wchan 2>/dev/null)"; } > "$dir/niri.txt"
     fi
     notify "GPU/kernel fault: $key" "$(cut -c1-180 <<<"${line#* * }")
-Snapshot: $dir. Consider rebooting before you suspend."
+Snapshot: $dir. $advice"
   done
 }
 
